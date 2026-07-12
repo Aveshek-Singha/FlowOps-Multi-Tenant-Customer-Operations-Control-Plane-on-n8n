@@ -1,0 +1,51 @@
+# ── Secrets — NEVER commit real values ──────────────────────────────
+.env
+.env.local
+.env.*.local
+*.local
+
+# ── n8n ─────────────────────────────────────────────────────────────
+n8n-data/
+*.sqlite
+*.sqlite-journal
+
+# ── Node / Next.js (frontend) ───────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+dist/
+.vercel/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── OS / editor cruft ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Local tooling cruft (Claude Code, puku) ─────────────────────────
+.claude/
+.puku/
+
+# ── Stray root node artifacts (frontend has its own in frontend/) ───
+/package.json
+/package-lock.json
+
+# ── Markdown: ignore all except README ──────────────────────────────
+*.md
+!README.md
+
+# ── CODEOWNERS (excluded per request) ───────────────────────────────
+CODEOWNERS
+
+# ── Misc local artifacts ────────────────────────────────────────────
+*.stackdump
+Capture.JPG
