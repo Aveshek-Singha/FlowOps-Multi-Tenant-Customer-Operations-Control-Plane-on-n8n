@@ -1,0 +1,100 @@
+{
+  "name": "02-idempotency-check",
+  "id": "a10b0000-0000-4000-8000-000000000004",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    { "name": "flowops" },
+    { "name": "backbone" }
+  ],
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "execute-workflow-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 120]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "idempotency-check",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "idempotency-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, -120],
+      "webhookId": "idempotency-check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Contract G2 — input {key, tenant_id} (optional workflow). Callable two ways:\n//  - Execute Workflow node: fields arrive flat on the item.\n//  - POST /webhook/idempotency-check: n8n wraps the body under `.body`.\nconst in0 = $input.first().json || {};\nconst src = in0.body || in0;\n\nconst key = src.key;\nif (!key) {\n  // Fail loud so the global error workflow (Contract G1) catches a malformed caller.\n  throw new Error('idempotency-check: missing key');\n}\n\nreturn [{\n  json: {\n    key: key,\n    tenant_id: src.tenant_id || null,\n    workflow: src.workflow || null,\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || ''\n  }\n}];"
+      },
+      "id": "normalize-input",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Normalize Input').item.json.supabase_url }}/rest/v1/idempotency_keys?on_conflict=key",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "resolution=ignore-duplicates,return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"key\": {{ JSON.stringify($('Normalize Input').item.json.key) }},\n  \"tenant_id\": {{ JSON.stringify($('Normalize Input').item.json.tenant_id) }},\n  \"workflow\": {{ JSON.stringify($('Normalize Input').item.json.workflow) }}\n}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "insert-key",
+      "name": "Insert Key",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// INSERT ... ON CONFLICT DO NOTHING via PostgREST:\n//   new insert  -> body is the inserted row  -> [{...}] -> dup=false\n//   conflict    -> nothing inserted           -> []      -> dup=true\n// fullResponse=true keeps a single wrapper item even when body is [] (an empty\n// array body would otherwise split into zero items and starve the last node).\nconst resp = $('Insert Key').first().json || {};\nconst rows = resp.body;\nconst dup = Array.isArray(rows) ? rows.length === 0 : !rows;\nconst norm = $('Normalize Input').first().json;\nreturn [{ json: { key: norm.key, tenant_id: norm.tenant_id, dup: dup } }];"
+      },
+      "id": "compute-dup",
+      "name": "Compute Dup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Webhook": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Normalize Input": {
+      "main": [[{ "node": "Insert Key", "type": "main", "index": 0 }]]
+    },
+    "Insert Key": {
+      "main": [[{ "node": "Compute Dup", "type": "main", "index": 0 }]]
+    }
+  }
+}
