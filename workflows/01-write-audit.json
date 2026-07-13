@@ -1,0 +1,72 @@
+{
+  "name": "01-write-audit",
+  "id": "a10b0000-0000-4000-8000-000000000002",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "flowops" }, { "name": "backbone" }],
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "execute-workflow-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: {tenant_id, correlation_id, service, step, status, payload}\n// Normalize + validate before insert. payload is stringified to JSONB-safe object.\nconst in0 = ($input.first().json) || {};\nconst payload = in0.payload == null ? {} : in0.payload;\nreturn [{\n  json: {\n    tenant_id: in0.tenant_id || null,\n    correlation_id: in0.correlation_id,\n    service: in0.service || 'unknown',\n    step: in0.step || 'unknown',\n    status: in0.status || 'started',\n    payload: (typeof payload === 'string') ? JSON.parse(payload) : payload\n  }\n}];"
+      },
+      "id": "normalize-input",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/audit_log",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tenant_id\": {{ JSON.stringify($('Normalize Input').item.json.tenant_id) }},\n  \"correlation_id\": {{ JSON.stringify($('Normalize Input').item.json.correlation_id) }},\n  \"service\": {{ JSON.stringify($('Normalize Input').item.json.service) }},\n  \"step\": {{ JSON.stringify($('Normalize Input').item.json.step) }},\n  \"status\": {{ JSON.stringify($('Normalize Input').item.json.status) }},\n  \"payload\": {{ JSON.stringify($('Normalize Input').item.json.payload) }}\n}",
+        "options": {}
+      },
+      "id": "insert-audit",
+      "name": "Insert Audit Row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// PostgREST returns an array with the inserted row (return=representation).\nconst rows = $('Insert Audit Row').first().json || [];\nconst row = Array.isArray(rows) ? rows[0] : rows;\nreturn [{ json: row || { inserted: true } }];"
+      },
+      "id": "echo",
+      "name": "Echo Inserted Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+    },
+    "Normalize Input": {
+      "main": [[{ "node": "Insert Audit Row", "type": "main", "index": 0 }]]
+    },
+    "Insert Audit Row": {
+      "main": [[{ "node": "Echo Inserted Row", "type": "main", "index": 0 }]]
+    }
+  }
+}

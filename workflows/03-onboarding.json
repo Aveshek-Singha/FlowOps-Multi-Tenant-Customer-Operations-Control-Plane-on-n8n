@@ -1,0 +1,733 @@
+{
+  "name": "03-onboarding",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-onboarding",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "onboarding-webhook",
+      "name": "Onboarding Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "stripe-onboarding"
+    },
+    {
+      "parameters": {
+        "jsCode": "// --- Ingress: normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe checkout.session.completed event.\nfunction uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\n// Stripe shape: { type, data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'New Tenant';\nconst plan = body.plan || 'free';\nconst region = body.region || 'us-east-1';\n// amount in USD. Stripe amount_total is in cents.\nconst amount_usd = body.amount_usd != null\n  ? Number(body.amount_usd)\n  : (stripeObj.amount_total != null ? Number(stripeObj.amount_total) / 100 : 0);\nconst source = body.source || (body.type ? 'stripe' : 'manual');\n\n// Lead-owned idempotency key derivation: stable source id, never random.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst idem_key = 'onboarding:' + (event_id || (tenant_id + ':' + email));\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\nconst correlation_id = uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    plan,\n    region,\n    amount_usd,\n    source,\n    event_id,\n    idem_key,\n    correlation_id,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    n8n_domain: ($env.N8N_DOMAIN || '').replace(/\\/$/, '')\n  }\n}];"
+      },
+      "id": "normalize",
+      "name": "Gen Correlation + Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Gen Correlation + Normalize').item.json.correlation_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shape {key, tenant_id} for the 02-idempotency-check sub-workflow (Contract G2).\nconst p = $('Gen Correlation + Normalize').first().json;\nif (!p.tenant_id) {\n  throw new Error('onboarding: missing tenant_id (required for provisioning)');\n}\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id, workflow: '03-onboarding' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'ingest',\n  status: 'skipped',\n  payload: { reason: 'duplicate event', key: $('Idempotency Check').first().json.key, via: 'contract-g' }\n} }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id } }];"
+      },
+      "id": "prep-resolve",
+      "name": "Prep Resolve Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000001",
+        "options": {}
+      },
+      "id": "resolve-policy",
+      "name": "Resolve Policy",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1320,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'ingest',\n  status: 'started',\n  payload: { source: p.source, execution_id: p.execution_id, amount_usd: p.amount_usd }\n} }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/tenants?on_conflict=id",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"id\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.tenant_id) }},\n  \"name\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.tenant_name) }},\n  \"plan\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.plan) }},\n  \"region\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.region) }},\n  \"status\": \"active\"\n}",
+        "options": {}
+      },
+      "id": "upsert-tenant",
+      "name": "Upsert Tenant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/seats?on_conflict=tenant_id,user_email",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tenant_id\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.tenant_id) }},\n  \"user_email\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.email) }},\n  \"status\": \"active\"\n}",
+        "options": {}
+      },
+      "id": "create-seat",
+      "name": "Create Seat",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2200,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "over-threshold",
+              "leftValue": "={{ Number($('Gen Correlation + Normalize').item.json.amount_usd) }}",
+              "rightValue": "={{ Number($('Resolve Policy').item.json.policy.approval.required_over_usd) }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "approval-required",
+      "name": "Approval Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "=\ud83d\udd14 *Onboarding approval needed*\nTenant: {{ $('Resolve Policy').item.json.tenant_name }} ({{ $('Resolve Policy').item.json.plan }})\nAmount: ${{ $('Gen Correlation + Normalize').item.json.amount_usd }}\nApprover: {{ $('Resolve Policy').item.json.policy.approval.approver }}\nCorrelation: `{{ $('Gen Correlation + Normalize').item.json.correlation_id }}`",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "reply_markup": "={{ JSON.stringify({ inline_keyboard: [[ { text: '\u2705 Approve', url: $execution.resumeUrl + '?decision=approve' }, { text: '\u274c Reject', url: $execution.resumeUrl + '?decision=reject' } ]] }) }}"
+        }
+      },
+      "id": "send-approval",
+      "name": "Send Approval Request",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2640,
+        260
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegramBot",
+          "name": "telegramBot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {
+          "limitWaitTime": true,
+          "limitType": "afterTimeInterval",
+          "resumeAmount": 24,
+          "resumeUnit": "hours"
+        }
+      },
+      "id": "wait-approval",
+      "name": "Wait For Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2860,
+        260
+      ],
+      "webhookId": "onboarding-approval-resume"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-approve",
+              "leftValue": "={{ $json.query.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "approved",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Grant entitlements from the resolved policy (batch upsert to PostgREST).\nconst p = $('Gen Correlation + Normalize').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst ents = (pol.policy && pol.policy.entitlements) || {};\nconst H = { apikey: p.service_key, Authorization: 'Bearer ' + p.service_key, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=representation' };\nconst rows = Object.keys(ents).map(function (feature) {\n  return { tenant_id: p.tenant_id, feature: feature, enabled: !!ents[feature] };\n});\nlet result = [];\nif (rows.length > 0) {\n  result = await this.helpers.httpRequest({\n    method: 'POST',\n    url: p.supabase_url + '/rest/v1/entitlements?on_conflict=tenant_id,feature',\n    headers: H,\n    body: rows,\n    json: true\n  });\n}\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, entitlements: ents, granted: rows.length } }];"
+      },
+      "id": "grant-entitlements",
+      "name": "Grant Entitlements",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "=\u2705 *Tenant onboarded*\n{{ $('Resolve Policy').item.json.tenant_name }} ({{ $('Resolve Policy').item.json.plan }}) provisioned.\nEntitlements: {{ $('Grant Entitlements').item.json.granted }} applied.\nCorrelation: `{{ $('Gen Correlation + Normalize').item.json.correlation_id }}`",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "notify-csm",
+      "name": "Notify CSM",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        3520,
+        420
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegramBot",
+          "name": "telegramBot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nconst pol = $('Resolve Policy').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'complete',\n  status: 'success',\n  payload: { plan: pol.plan, entitlements: pol.policy.entitlements, granted: $('Grant Entitlements').first().json.granted }\n} }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3740,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        3960,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'approval',\n  status: 'skipped',\n  payload: { decision: 'rejected', approver: $('Resolve Policy').first().json.policy.approval.approver }\n} }];"
+      },
+      "id": "prep-audit-rejected",
+      "name": "Prep Audit: Rejected",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-rejected",
+      "name": "Audit: Rejected",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        3520,
+        80
+      ]
+    }
+  ],
+  "connections": {
+    "Onboarding Webhook": {
+      "main": [
+        [
+          {
+            "node": "Gen Correlation + Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gen Correlation + Normalize": {
+      "main": [
+        [
+          {
+            "node": "Respond Queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Queued": {
+      "main": [
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Idempotency Input": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Resolve Input": {
+      "main": [
+        [
+          {
+            "node": "Resolve Policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Policy": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Upsert Tenant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Tenant": {
+      "main": [
+        [
+          {
+            "node": "Create Seat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Seat": {
+      "main": [
+        [
+          {
+            "node": "Approval Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Required?": {
+      "main": [
+        [
+          {
+            "node": "Send Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Grant Entitlements",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Approval Request": {
+      "main": [
+        [
+          {
+            "node": "Wait For Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait For Approval": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Grant Entitlements",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Audit: Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Grant Entitlements": {
+      "main": [
+        [
+          {
+            "node": "Notify CSM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify CSM": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Success": {
+      "main": [
+        [
+          {
+            "node": "Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Rejected": {
+      "main": [
+        [
+          {
+            "node": "Audit: Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "id": "a10b0000-0000-4000-8000-000000000003"
+}
