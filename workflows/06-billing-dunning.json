@@ -1,0 +1,488 @@
+{
+  "name": "06-billing-dunning",
+  "id": "a10b0000-0000-4000-8000-000000000007",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    { "name": "flowops" },
+    { "name": "service" }
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe-dunning",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "dunning-webhook",
+      "name": "Stripe Dunning Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "stripe-dunning"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 560],
+      "notesInFlow": true,
+      "notes": "Contract B: 05-dlq-replay re-injects the failed event here with replay:true + the original correlation_id, bypassing the webhook response + idempotency gate."
+    },
+    {
+      "parameters": {
+        "jsCode": "// --- Ingress: normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe invoice.payment_failed event.\nfunction uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\n// Stripe shape: { type: 'invoice.payment_failed', data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || root.tenant_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'Unknown Tenant';\nconst source = body.source || (body.type ? 'stripe' : 'manual');\n\n// Lead-owned idempotency key derivation: stable source id, NEVER random (Contract G).\n// Prefer the Stripe event id (unique per failed-payment attempt). If absent (manual\n// demo), fall back to a STABLE composite of the invoice + attempt so retries of the\n// same failed invoice dedupe correctly. No Date.now()/random — that would defeat dedup.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst stripe_invoice_id_early = stripeObj.id || body.stripe_invoice_id || null;\nconst attempt_early = stripeObj.attempt_count != null ? Number(stripeObj.attempt_count) : (body.attempt || 1);\nconst idem_key = 'dunning:' + (event_id || (tenant_id + ':' + (stripe_invoice_id_early || 'noinv') + ':' + attempt_early));\n\n// Contract B replay: 05-dlq-replay re-enters via the Execute Workflow Trigger with\n// {body: <original trigger>, correlation_id, tenant_id, replay:true}. Preserve the\n// original correlation_id and mark the run so it bypasses the idempotency gate.\nconst replay = !!root.replay;\nconst src = replay ? 'replay' : source;\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\n// On replay, reuse the original correlation_id so the failure, the redrive, and the\n// re-run all thread onto one correlation-ID search.\nconst correlation_id = (replay && root.correlation_id) ? root.correlation_id : uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    source: src,\n    event_id,\n    idem_key, correlation_id,\n    replay,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    // Stripe invoice fields we need\n    stripe_invoice_id: stripeObj.id || body.stripe_invoice_id || null,\n    amount_usd: stripeObj.amount_due != null ? Number(stripeObj.amount_due) / 100 : (body.amount_usd || 0),\n    attempt: stripeObj.attempt_count != null ? Number(stripeObj.attempt_count) : (body.attempt || 1),\n    customer_email: stripeObj.customer_email || body.customer_email || email,\n    // For manual demo: allow overriding\n    invoice_status: body.invoice_status || (stripeObj.status || 'payment_failed')\n  }\n}];"
+      },
+      "id": "normalize",
+      "name": "Gen Correlation + Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [330, 300],
+      "notesInFlow": true,
+      "notes": "Replay re-runs a known event on operator demand: skip the webhook response + idempotency gate (which would dedupe it as already-seen) and go straight to provisioning."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Gen Correlation + Normalize').item.json.correlation_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [560, 140]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shape {key, tenant_id} for the 02-idempotency-check sub-workflow (Contract G2).\nconst p = $('Gen Correlation + Normalize').first().json;\nif (!p.tenant_id) {\n  throw new Error('dunning: missing tenant_id (required for provisioning)');\n}\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id, workflow: '06-billing-dunning' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 300]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [760, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'dunning',\n  step: 'ingest',\n  status: 'skipped',\n  payload: { reason: 'duplicate event', key: $('Idempotency Check').first().json.key, via: 'contract-g' }\n} }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 140]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1320, 140]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id } }];"
+      },
+      "id": "prep-resolve",
+      "name": "Prep Resolve Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 420]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000001",
+        "options": {}
+      },
+      "id": "resolve-policy",
+      "name": "Resolve Policy",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1320, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'dunning',\n  step: 'ingest',\n  status: 'started',\n  payload: { source: p.source, execution_id: p.execution_id, amount_usd: p.amount_usd, stripe_invoice_id: p.stripe_invoice_id, attempt: p.attempt }\n} }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 420]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1760, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/invoices?on_conflict=stripe_id",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "resolution=merge-duplicates,return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tenant_id\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.tenant_id) }},\n  \"stripe_id\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.stripe_invoice_id) }},\n  \"status\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.invoice_status) }},\n  \"amount\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.amount_usd) }},\n  \"currency\": \"usd\",\n  \"attempt\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.attempt) }}\n}",
+        "options": {}
+      },
+      "id": "upsert-invoice",
+      "name": "Upsert Invoice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1980, 420],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine if this attempt exceeds policy max -> escalate to suspended.\nconst p = $('Gen Correlation + Normalize').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst maxAttempts = (pol.policy && pol.policy.retry && pol.policy.retry.max_attempts) || 3;\nconst currentAttempt = p.attempt || 1;\nconst isFinal = currentAttempt >= maxAttempts;\nreturn [{ json: { isFinal, maxAttempts, currentAttempt, policy: pol.policy } }];"
+      },
+      "id": "check-escalation",
+      "name": "Check Escalation?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "escalate", "leftValue": "={{ $json.isFinal }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true", "singleValue": true } }
+          ]
+        },
+        "options": {}
+      },
+      "id": "should-escalate",
+      "name": "Escalate to Suspended?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2420, 420]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/tenants?id=eq.{{ $('Gen Correlation + Normalize').item.json.tenant_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"suspended\"\n}",
+        "options": {}
+      },
+      "id": "suspend-tenant",
+      "name": "Suspend Tenant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2640, 260],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/health_signals",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tenant_id\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.tenant_id) }},\n  \"metric\": \"payment_failure\",\n  \"value\": {{ JSON.stringify($('Gen Correlation + Normalize').item.json.amount_usd) }},\n  \"ts\": \"{{ new Date().toISOString() }}\"\n}",
+        "options": {}
+      },
+      "id": "push-health-signal",
+      "name": "Push Health Signal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2640, 420],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Resolve the health-score penalty from tenant policy (default 10 per failed payment).\n// The next nodes fetch the current score, subtract this, and PATCH the numeric result\n// (PostgREST can't evaluate a SQL expression like GREATEST() in a JSON body).\n// NOTE: fetch-then-patch is not atomic; acceptable because dunning events per tenant\n// are rare and serialized. A future hardening would move this to an atomic RPC.\nconst p = $('Gen Correlation + Normalize').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst penalty = (pol.policy && pol.policy.retry && pol.policy.retry.health_penalty) || 10;\nreturn [{ json: { penalty, tenant_id: p.tenant_id, correlation_id: p.correlation_id } }];"
+      },
+      "id": "compute-penalty",
+      "name": "Compute Health Penalty",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 420]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/tenants?id=eq.{{ $('Gen Correlation + Normalize').item.json.tenant_id }}&select=health_score",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fetch-health",
+      "name": "Fetch Current Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3080, 420],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute new health_score and patch.\nconst p = $('Gen Correlation + Normalize').first().json;\nconst penalty = $('Compute Health Penalty').item.json.penalty;\nconst healthRows = $('Fetch Current Health').item.json;\nconst current = (Array.isArray(healthRows) ? healthRows[0] : healthRows)?.health_score || 100;\nconst newScore = Math.max(0, current - penalty);\nreturn [{ json: { new_health_score: newScore, penalty, tenant_id: p.tenant_id } }];"
+      },
+      "id": "compute-new-health",
+      "name": "Compute New Health Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3300, 420]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $('Gen Correlation + Normalize').item.json.supabase_url }}/rest/v1/tenants?id=eq.{{ $('Gen Correlation + Normalize').item.json.tenant_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"health_score\": {{ JSON.stringify($('Compute New Health Score').item.json.new_health_score) }}\n}",
+        "options": {}
+      },
+      "id": "decrement-health",
+      "name": "Decrement Health Score",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3520, 420],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Notify finance + CSM via Telegram (Code node, non-throwing; mirrors G1 pattern).\nconst p = $('Gen Correlation + Normalize').first().json;\nconst esc = $('Check Escalation?').first().json;\nconst text = [\n  esc.isFinal ? '🚨 *Dunning escalation: tenant suspended*' : '💸 *Dunning event: payment failed*',\n  'Tenant: ' + (p.tenant_name || 'unknown') + ' (' + (p.tenant_id || 'n/a') + ')',\n  'Invoice: ' + (p.stripe_invoice_id || 'n/a') + '  |  Amount: $' + (p.amount_usd || 0),\n  'Attempt: ' + (p.attempt || 1) + ' / ' + (esc.maxAttempts || 3),\n  esc.isFinal ? 'Status: SUSPENDED' : 'Status: ACTIVE (retrying)',\n  'Correlation: `' + (p.correlation_id || 'n/a') + '`'\n].join('\\n');\n\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\n\nif (token && chat) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.telegram.org/bot' + token + '/sendMessage',\n      body: { chat_id: chat, text: text, parse_mode: 'Markdown' },\n      json: true\n    });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\n\nreturn [{ json: { alert_delivered, notice, escalated: esc.isFinal } }];"
+      },
+      "id": "notify-telegram",
+      "name": "Notify Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3300, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nconst esc = $('Check Escalation?').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'dunning',\n  step: 'complete',\n  status: 'success',\n  payload: { invoice_id: p.stripe_invoice_id, attempt: p.attempt, escalated: esc.isFinal, health_penalty: $('Compute Health Penalty').item.json.penalty, telegram_delivered: $('Notify Telegram').item.json.alert_delivered }\n} }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3520, 420]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [3740, 420]
+    }
+  ],
+  "connections": {
+    "Stripe Dunning Webhook": {
+      "main": [[{ "node": "Gen Correlation + Normalize", "type": "main", "index": 0 }]]
+    },
+    "Replay Entry": {
+      "main": [[{ "node": "Gen Correlation + Normalize", "type": "main", "index": 0 }]]
+    },
+    "Gen Correlation + Normalize": {
+      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+    },
+    "Is Replay?": {
+      "main": [
+        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }],
+        [{ "node": "Respond Queued", "type": "main", "index": 0 }]
+      ]
+    },
+    "Respond Queued": {
+      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+    },
+    "Prep Idempotency Input": {
+      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+    },
+    "Idempotency Check": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+    },
+    "Prep Resolve Input": {
+      "main": [[{ "node": "Resolve Policy", "type": "main", "index": 0 }]]
+    },
+    "Resolve Policy": {
+      "main": [[{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Started": {
+      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+    },
+    "Audit: Started": {
+      "main": [[{ "node": "Upsert Invoice", "type": "main", "index": 0 }]]
+    },
+    "Upsert Invoice": {
+      "main": [[{ "node": "Check Escalation?", "type": "main", "index": 0 }]]
+    },
+    "Check Escalation?": {
+      "main": [[{ "node": "Escalate to Suspended?", "type": "main", "index": 0 }]]
+    },
+    "Escalate to Suspended?": {
+      "main": [
+        [{ "node": "Suspend Tenant", "type": "main", "index": 0 }],
+        [{ "node": "Push Health Signal", "type": "main", "index": 0 }]
+      ]
+    },
+    "Suspend Tenant": {
+      "main": [[{ "node": "Push Health Signal", "type": "main", "index": 0 }]]
+    },
+    "Push Health Signal": {
+      "main": [[{ "node": "Compute Health Penalty", "type": "main", "index": 0 }]]
+    },
+    "Compute Health Penalty": {
+      "main": [[{ "node": "Fetch Current Health", "type": "main", "index": 0 }]]
+    },
+    "Fetch Current Health": {
+      "main": [[{ "node": "Compute New Health Score", "type": "main", "index": 0 }]]
+    },
+    "Compute New Health Score": {
+      "main": [[{ "node": "Decrement Health Score", "type": "main", "index": 0 }]]
+    },
+    "Decrement Health Score": {
+      "main": [[{ "node": "Notify Telegram", "type": "main", "index": 0 }]]
+    },
+    "Notify Telegram": {
+      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Success": {
+      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+    }
+  }
+}
