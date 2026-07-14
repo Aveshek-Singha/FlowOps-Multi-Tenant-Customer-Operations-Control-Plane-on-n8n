@@ -1,0 +1,394 @@
+{
+  "name": "05-dlq-replay",
+  "id": "a10b0000-0000-4000-8000-000000000006",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    { "name": "flowops" },
+    { "name": "reliability" }
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dlq-replay",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "replay-webhook",
+      "name": "Replay Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "dlq-replay"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Contract B ingress: { dlq_id, operator }. n8n wraps a POST body under `.body`.\nconst root = $input.first().json || {};\nconst body = root.body || root;\nconst dlq_id = body.dlq_id || null;\nconst operator = body.operator || 'unknown';\nconst uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (!dlq_id || !uuidRe.test(String(dlq_id))) {\n  // Bad request — carry the error forward, the Guard will emit a 400 via the single Respond path.\n  return [{ json: { _bad: true, code: 400, message: 'dlq_id missing or not a uuid', dlq_id, operator, correlation_id: null } }];\n}\nreturn [{ json: {\n  dlq_id,\n  operator,\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n  service_key: $env.SUPABASE_SERVICE_KEY || ''\n} }];"
+      },
+      "id": "parse-input",
+      "name": "Parse Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.supabase_url }}/rest/v1/dead_letter_queue?id=eq.{{ $json.dlq_id }}&select=*",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "accept", "value": "application/json" }
+          ]
+        },
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "load-dlq",
+      "name": "Load DLQ Row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [400, 300],
+      "onError": "continueRegularOutput",
+      "notesInFlow": true,
+      "notes": "Service-key read (bypasses RLS). fullResponse keeps a single wrapper item even when the row is missing ([] body would otherwise split into zero items and starve Guard). Non-throwing."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide replayability. Emits a single item carrying either a refusal (ok:false + code)\n// or a green light (ok:true + everything the dispatch path needs). The IF after this\n// routes to exactly one Respond node, so responseMode:responseNode never dangles.\nconst p = $('Parse Input').first().json || {};\n\n// Registry of replayable source workflows: DLQ.workflow name -> target n8n workflow id.\n// G1 stores the failed workflow's NAME, so we key on that. Extend as services 2-11 land.\nconst REGISTRY = { '03-onboarding': 'a10b0000-0000-4000-8000-000000000003' };\n\nfunction refuse(code, message, correlation_id) {\n  return [{ json: { ok: false, code, message, correlation_id: correlation_id || null, operator: p.operator } }];\n}\n\n// Bad input short-circuited in Parse Input.\nif (p._bad) return refuse(p.code || 400, p.message || 'bad request', null);\n\nconst resp = $('Load DLQ Row').first().json || {};\nconst rows = resp.body;\nif (!Array.isArray(rows)) return refuse(500, 'could not read dead_letter_queue', null);\nif (rows.length === 0) return refuse(404, 'dlq_id not found', null);\n\nconst row = rows[0];\nconst cid = row.correlation_id || null;\n\nif (row.status === 'manual')   return refuse(409, 'refused: poison / attempt cap reached (status=manual)', cid);\nif (row.status === 'resolved') return refuse(409, 'already resolved', cid);\nif (row.status === 'replayed') return refuse(409, 'a replay is already in progress', cid);\nif (row.status !== 'open')     return refuse(409, 'not replayable in status=' + row.status, cid);\n\nconst target = REGISTRY[row.workflow];\nif (!target) return refuse(409, 'no replay handler registered for workflow ' + row.workflow, cid);\n\nconst payload = row.payload || {};\nconst trigger = payload.trigger || null;\nif (!trigger || typeof trigger !== 'object' || Object.keys(trigger).length === 0) {\n  return refuse(409, 'nothing to replay: original trigger payload was not captured', cid);\n}\nconst tenant_id = row.tenant_id || trigger.tenant_id || null;\nif (!tenant_id) return refuse(409, 'cannot replay: no tenant_id on the DLQ row or its trigger payload', cid);\n\nreturn [{ json: {\n  ok: true,\n  dlq_id: p.dlq_id,\n  operator: p.operator,\n  target_workflow_id: target,\n  workflow_name: row.workflow,\n  correlation_id: cid,\n  tenant_id,\n  trigger,\n  attempts: row.attempts,\n  supabase_url: p.supabase_url\n} }];"
+      },
+      "id": "guard",
+      "name": "Guard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [600, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replayable",
+      "name": "Replayable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [800, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', correlation_id: $json.correlation_id || null, message: $json.message }) }}",
+        "options": {
+          "responseCode": "={{ $json.code || 400 }}"
+        }
+      },
+      "id": "respond-error",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1020, 460]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $('Guard').item.json.supabase_url }}/rest/v1/dead_letter_queue?id=eq.{{ $('Guard').item.json.dlq_id }}&status=eq.open",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"replayed\"\n}",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "claim-row",
+      "name": "Claim Row (open->replayed)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1020, 200],
+      "onError": "continueRegularOutput",
+      "notesInFlow": true,
+      "notes": "Atomic compare-and-swap: filter status=eq.open so two concurrent Replay clicks can't both dispatch. return=representation -> [] means we lost the race."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "claimed",
+              "leftValue": "={{ ($json.body && Array.isArray($json.body)) ? $json.body.length : 0 }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "claimed",
+      "name": "Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1220, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', correlation_id: $('Guard').item.json.correlation_id || null, message: 'a replay is already in progress' }) }}",
+        "options": { "responseCode": 409 }
+      },
+      "id": "respond-lost-race",
+      "name": "Respond Lost Race",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1440, 60]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Guard').item.json.correlation_id || null, message: 'replay dispatched to ' + $('Guard').item.json.workflow_name }) }}",
+        "options": { "responseCode": 202 }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1440, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Guard').first().json;\nreturn [{ json: {\n  tenant_id: g.tenant_id,\n  correlation_id: g.correlation_id,\n  service: 'replay',\n  step: 'dispatch',\n  status: 'started',\n  payload: { dlq_id: g.dlq_id, operator: g.operator, workflow: g.workflow_name, from_attempts: g.attempts }\n} }];"
+      },
+      "id": "prep-audit-dispatch",
+      "name": "Prep Audit: Dispatch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 260]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dispatch",
+      "name": "Audit: Dispatch",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1840, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Shape the re-injection payload for the source workflow's Execute Workflow Trigger.\n// body = the ORIGINAL trigger; correlation_id preserved; replay:true so the source\n// bypasses its idempotency gate and reuses the id.\nconst g = $('Guard').first().json;\nreturn [{ json: {\n  body: g.trigger,\n  correlation_id: g.correlation_id,\n  tenant_id: g.tenant_id,\n  replay: true,\n  dlq_id: g.dlq_id\n} }];"
+      },
+      "id": "prep-dispatch",
+      "name": "Prep Dispatch Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 260]
+    },
+    {
+      "parameters": {
+        "workflowId": "={{ $('Guard').item.json.target_workflow_id }}",
+        "options": { "waitForSubWorkflow": true }
+      },
+      "id": "dispatch",
+      "name": "Dispatch To Source",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2240, 260],
+      "onError": "continueErrorOutput",
+      "notesInFlow": true,
+      "notes": "Re-run the source synchronously so we know success/fail. continueErrorOutput splits: out0 -> resolve, out1 -> bump toward the cap. Errors are CAUGHT here so 05 never fails -> its own errorWorkflow (none) can't create a mis-attributed 05-dlq-replay row."
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Guard').first().json;\nreturn [{ json: {\n  tenant_id: g.tenant_id,\n  correlation_id: g.correlation_id,\n  service: 'replay',\n  step: 'dispatch',\n  status: 'success',\n  payload: { dlq_id: g.dlq_id, operator: g.operator, workflow: g.workflow_name }\n} }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2460, 160]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2660, 160]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $('Guard').item.json.supabase_url }}/rest/v1/dead_letter_queue?id=eq.{{ $('Guard').item.json.dlq_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"resolved\"\n}",
+        "options": {}
+      },
+      "id": "mark-resolved",
+      "name": "Mark Resolved",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2860, 160],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Replay failed again. Classify (same lens as G1) and bump the SAME row via the central\n// bump_dlq RPC keyed by the ORIGINAL (correlation_id, workflow) -> attempts++ and\n// -> manual at the cap. We do this explicitly (not via G1) because 05 CAUGHT the error,\n// so the original workflow's name is preserved rather than being recorded as 05-dlq-replay.\nconst g = $('Guard').first().json;\nconst errItem = $input.first().json || {};\nconst err = errItem.error || {};\nconst msg = String(err.message || errItem.message || 'replay re-failed').slice(0, 500);\nconst hay = (msg + ' ' + (err.name || '')).toLowerCase();\nconst poison = ['syntaxerror','typeerror','unexpected token','missing tenant','cannot read prop','is not valid json',' 400',' 401',' 403',' 422','validation','malformed'];\nlet error_class = 'transient';\nif (poison.some(s => hay.includes(s))) error_class = 'poison';\nreturn [{ json: {\n  supabase_url: g.supabase_url,\n  p_correlation_id: g.correlation_id,\n  p_workflow: g.workflow_name,\n  p_tenant_id: g.tenant_id,\n  p_error: msg,\n  p_error_class: error_class,\n  p_payload: { trigger: g.trigger, replay: true, operator: g.operator }\n} }];"
+      },
+      "id": "prep-bump",
+      "name": "Prep Re-fail Bump",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2460, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.supabase_url }}/rest/v1/rpc/bump_dlq",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"p_correlation_id\": {{ JSON.stringify($json.p_correlation_id) }},\n  \"p_workflow\": {{ JSON.stringify($json.p_workflow) }},\n  \"p_tenant_id\": {{ JSON.stringify($json.p_tenant_id) }},\n  \"p_error\": {{ JSON.stringify($json.p_error) }},\n  \"p_error_class\": {{ JSON.stringify($json.p_error_class) }},\n  \"p_payload\": {{ JSON.stringify($json.p_payload) }}\n}",
+        "options": {
+          "response": { "response": { "fullResponse": true } }
+        }
+      },
+      "id": "bump-dlq",
+      "name": "Bump DLQ (re-fail)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 380],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const g = $('Guard').first().json;\nconst bumped = $('Bump DLQ (re-fail)').first().json || {};\nconst arr = bumped.body;\nconst row = Array.isArray(arr) ? (arr[0] || {}) : (arr || {});\nreturn [{ json: {\n  tenant_id: g.tenant_id,\n  correlation_id: g.correlation_id,\n  service: 'replay',\n  step: 'dispatch',\n  status: 'error',\n  payload: { dlq_id: g.dlq_id, operator: g.operator, workflow: g.workflow_name, attempts: row.attempts != null ? row.attempts : null, new_status: row.status || null }\n} }];"
+      },
+      "id": "prep-audit-error",
+      "name": "Prep Audit: Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2860, 380]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-error",
+      "name": "Audit: Error",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [3060, 380]
+    }
+  ],
+  "connections": {
+    "Replay Webhook": {
+      "main": [[{ "node": "Parse Input", "type": "main", "index": 0 }]]
+    },
+    "Parse Input": {
+      "main": [[{ "node": "Load DLQ Row", "type": "main", "index": 0 }]]
+    },
+    "Load DLQ Row": {
+      "main": [[{ "node": "Guard", "type": "main", "index": 0 }]]
+    },
+    "Guard": {
+      "main": [[{ "node": "Replayable?", "type": "main", "index": 0 }]]
+    },
+    "Replayable?": {
+      "main": [
+        [{ "node": "Claim Row (open->replayed)", "type": "main", "index": 0 }],
+        [{ "node": "Respond Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Claim Row (open->replayed)": {
+      "main": [[{ "node": "Claimed?", "type": "main", "index": 0 }]]
+    },
+    "Claimed?": {
+      "main": [
+        [{ "node": "Respond Queued", "type": "main", "index": 0 }],
+        [{ "node": "Respond Lost Race", "type": "main", "index": 0 }]
+      ]
+    },
+    "Respond Queued": {
+      "main": [[{ "node": "Prep Audit: Dispatch", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Dispatch": {
+      "main": [[{ "node": "Audit: Dispatch", "type": "main", "index": 0 }]]
+    },
+    "Audit: Dispatch": {
+      "main": [[{ "node": "Prep Dispatch Payload", "type": "main", "index": 0 }]]
+    },
+    "Prep Dispatch Payload": {
+      "main": [[{ "node": "Dispatch To Source", "type": "main", "index": 0 }]]
+    },
+    "Dispatch To Source": {
+      "main": [
+        [{ "node": "Prep Audit: Success", "type": "main", "index": 0 }],
+        [{ "node": "Prep Re-fail Bump", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Audit: Success": {
+      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+    },
+    "Audit: Success": {
+      "main": [[{ "node": "Mark Resolved", "type": "main", "index": 0 }]]
+    },
+    "Prep Re-fail Bump": {
+      "main": [[{ "node": "Bump DLQ (re-fail)", "type": "main", "index": 0 }]]
+    },
+    "Bump DLQ (re-fail)": {
+      "main": [[{ "node": "Prep Audit: Error", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Error": {
+      "main": [[{ "node": "Audit: Error", "type": "main", "index": 0 }]]
+    }
+  }
+}

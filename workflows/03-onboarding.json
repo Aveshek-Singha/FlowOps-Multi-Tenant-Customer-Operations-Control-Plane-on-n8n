@@ -2,7 +2,8 @@
   "name": "03-onboarding",
   "active": false,
   "settings": {
-    "executionOrder": "v1"
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
   },
   "tags": [
     {
@@ -31,8 +32,21 @@
       "webhookId": "stripe-onboarding"
     },
     {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        560
+      ],
+      "notesInFlow": true,
+      "notes": "Contract B: 05-dlq-replay re-injects the failed event here with replay:true + the original correlation_id, bypassing the webhook response + idempotency gate."
+    },
+    {
       "parameters": {
-        "jsCode": "// --- Ingress: normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe checkout.session.completed event.\nfunction uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\n// Stripe shape: { type, data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'New Tenant';\nconst plan = body.plan || 'free';\nconst region = body.region || 'us-east-1';\n// amount in USD. Stripe amount_total is in cents.\nconst amount_usd = body.amount_usd != null\n  ? Number(body.amount_usd)\n  : (stripeObj.amount_total != null ? Number(stripeObj.amount_total) / 100 : 0);\nconst source = body.source || (body.type ? 'stripe' : 'manual');\n\n// Lead-owned idempotency key derivation: stable source id, never random.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst idem_key = 'onboarding:' + (event_id || (tenant_id + ':' + email));\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\nconst correlation_id = uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    plan,\n    region,\n    amount_usd,\n    source,\n    event_id,\n    idem_key,\n    correlation_id,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    n8n_domain: ($env.N8N_DOMAIN || '').replace(/\\/$/, '')\n  }\n}];"
+        "jsCode": "// --- Ingress: normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe checkout.session.completed event.\nfunction uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\n// Stripe shape: { type, data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || root.tenant_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'New Tenant';\nconst plan = body.plan || 'free';\nconst region = body.region || 'us-east-1';\n// amount in USD. Stripe amount_total is in cents.\nconst amount_usd = body.amount_usd != null\n  ? Number(body.amount_usd)\n  : (stripeObj.amount_total != null ? Number(stripeObj.amount_total) / 100 : 0);\n// Contract B replay: 05-dlq-replay re-enters via the Execute Workflow Trigger with\n// {body: <original trigger>, correlation_id, tenant_id, replay:true}. Preserve the\n// original correlation_id and mark the run so it bypasses the idempotency gate.\nconst replay = !!root.replay;\nconst source = replay ? 'replay' : (body.source || (body.type ? 'stripe' : 'manual'));\n\n// Lead-owned idempotency key derivation: stable source id, never random.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst idem_key = 'onboarding:' + (event_id || (tenant_id + ':' + email));\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\n// On replay, reuse the original correlation_id so the failure, the redrive, and the\n// re-run all thread onto one correlation-ID search.\nconst correlation_id = (replay && root.correlation_id) ? root.correlation_id : uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    plan,\n    region,\n    amount_usd,\n    source,\n    replay,\n    event_id,\n    idem_key,\n    correlation_id,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    n8n_domain: ($env.N8N_DOMAIN || '').replace(/\\/$/, '')\n  }\n}];"
       },
       "id": "normalize",
       "name": "Gen Correlation + Normalize",
@@ -42,6 +56,40 @@
         220,
         300
       ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        330,
+        300
+      ],
+      "notesInFlow": true,
+      "notes": "Replay re-runs a known event on operator demand: skip the webhook response + idempotency gate (which would dedupe it as already-seen) and go straight to provisioning."
     },
     {
       "parameters": {
@@ -487,8 +535,37 @@
         ]
       ]
     },
+    "Replay Entry": {
+      "main": [
+        [
+          {
+            "node": "Gen Correlation + Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Gen Correlation + Normalize": {
       "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Replay?": {
+      "main": [
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Respond Queued",
