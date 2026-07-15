@@ -1,0 +1,561 @@
+{
+  "name": "11-dsar-privacy",
+  "id": "a10b0000-0000-4000-8000-000000000012",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dsar",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "dsar-webhook",
+      "name": "DSAR Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        280
+      ],
+      "webhookId": "dsar"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        520
+      ],
+      "notesInFlow": true,
+      "notes": "Contract B replay entry. Replays the original DSAR trigger with the same correlation_id."
+    },
+    {
+      "parameters": {
+        "jsCode": "function uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst type = String(body.type || 'export').toLowerCase();\nconst email = String(body.email || '').trim().toLowerCase();\nconst tenant_id = body.tenant_id || root.tenant_id || null;\nconst request_id = body.request_id || body.id || uuidv4();\nconst event_id = body.event_id || body.request_id || request_id;\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\nconst invalid = !tenant_id || !email || !['export', 'delete'].includes(type);\n\nreturn [{ json: {\n  tenant_id,\n  email,\n  type,\n  request_id,\n  event_id,\n  idem_key: 'dsar:' + event_id,\n  replay,\n  response_required,\n  invalid,\n  invalid_reason: invalid ? 'tenant_id, email, and type=export|delete are required' : null,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n  service_key: $env.SUPABASE_SERVICE_KEY || '',\n  telegram_token: $env.TELEGRAM_BOT_TOKEN || '',\n  telegram_chat: $env.TELEGRAM_CHAT_ID || ''\n} }];"
+      },
+      "id": "normalize",
+      "name": "Normalize Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needs-response",
+              "leftValue": "={{ $json.response_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "needs-response",
+      "name": "Needs Webhook Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'received', request_id: $('Normalize Request').item.json.request_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "respond-received",
+      "name": "Respond Received",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-invalid",
+              "leftValue": "={{ $json.invalid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-invalid",
+      "name": "Invalid Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Request').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'dsar', step: 'intake', status: 'rejected', payload: { request_id: p.request_id, reason: p.invalid_reason, email: p.email, type: p.type } } }];"
+      },
+      "id": "prep-audit-invalid",
+      "name": "Prep Audit: Invalid",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-invalid",
+      "name": "Audit: Invalid",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Request').first().json;\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id, workflow: '11-dsar-privacy' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Request').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'dsar', step: 'intake', status: 'skipped', payload: { reason: 'duplicate request', key: p.idem_key, request_id: p.request_id, email: p.email, type: p.type } } }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Request').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'dsar', step: 'intake', status: 'started', payload: { request_id: p.request_id, email: p.email, type: p.type, source: p.replay ? 'replay' : 'webhook', execution_id: p.execution_id } } }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Request').first().json;\nconst H = {\n  apikey: p.service_key,\n  Authorization: 'Bearer ' + p.service_key,\n  accept: 'application/json',\n  'content-type': 'application/json'\n};\nconst preferUpsert = Object.assign({}, H, { Prefer: 'resolution=merge-duplicates,return=representation' });\nconst preferPatch = Object.assign({}, H, { Prefer: 'return=representation' });\n\nfunction enc(value) {\n  return encodeURIComponent(String(value));\n}\nasync function get(path) {\n  return await this.helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: H, json: true });\n}\nasync function post(path, body, headers = preferUpsert) {\n  return await this.helpers.httpRequest({ method: 'POST', url: p.supabase_url + path, headers, body, json: true });\n}\nasync function patch(path, body) {\n  return await this.helpers.httpRequest({ method: 'PATCH', url: p.supabase_url + path, headers: preferPatch, body, json: true });\n}\n\nawait post('/rest/v1/dsar_requests?on_conflict=id', [{\n  id: p.request_id,\n  tenant_id: p.tenant_id,\n  email: p.email,\n  type: p.type,\n  status: 'processing',\n  evidence: {\n    correlation_id: p.correlation_id,\n    source: p.replay ? 'replay' : 'webhook',\n    received_at: new Date().toISOString()\n  }\n}]);\n\nconst tenantRows = await get('/rest/v1/tenants?id=eq.' + enc(p.tenant_id) + '&select=*');\nif (!tenantRows || tenantRows.length === 0) {\n  const evidence = {\n    correlation_id: p.correlation_id,\n    request_id: p.request_id,\n    rejected_at: new Date().toISOString(),\n    reason: 'tenant not found'\n  };\n  await patch('/rest/v1/dsar_requests?id=eq.' + enc(p.request_id), { status: 'rejected', evidence });\n  return [{ json: { ok: false, request_id: p.request_id, tenant_id: p.tenant_id, email: p.email, type: p.type, evidence, notice: 'tenant not found' } }];\n}\n\nconst tenant = tenantRows[0];\nconst seats = await get('/rest/v1/seats?tenant_id=eq.' + enc(p.tenant_id) + '&select=*');\nconst matchingSeats = (seats || []).filter((seat) => String(seat.user_email || '').toLowerCase() === p.email);\nconst entitlements = await get('/rest/v1/entitlements?tenant_id=eq.' + enc(p.tenant_id) + '&select=*');\nconst invoices = await get('/rest/v1/invoices?tenant_id=eq.' + enc(p.tenant_id) + '&select=*');\nconst health = await get('/rest/v1/health_signals?tenant_id=eq.' + enc(p.tenant_id) + '&select=metric,value,ts&order=ts.desc&limit=25');\nconst audits = await get('/rest/v1/audit_log?tenant_id=eq.' + enc(p.tenant_id) + '&select=service,step,status,payload,created_at&order=created_at.desc&limit=25');\n\nlet suppression = null;\nif (p.type === 'delete') {\n  const updatedSeats = await patch('/rest/v1/seats?tenant_id=eq.' + enc(p.tenant_id) + '&user_email=eq.' + enc(p.email), {\n    status: 'disabled'\n  });\n  suppression = {\n    matching_seats_disabled: Array.isArray(updatedSeats) ? updatedSeats.length : 0,\n    mode: 'suppression',\n    note: 'Demo-safe suppression disables matching seats and stores evidence; tenant financial/audit records are retained.'\n  };\n}\n\nconst dsarPackage = {\n  tenant: { id: tenant.id, name: tenant.name, plan: tenant.plan, region: tenant.region, status: tenant.status, health_score: tenant.health_score },\n  subject: { email: p.email, matched_seats: matchingSeats },\n  entitlements,\n  invoices,\n  health_signals: health,\n  recent_audit: audits\n};\nconst evidence = {\n  correlation_id: p.correlation_id,\n  request_id: p.request_id,\n  tenant_id: p.tenant_id,\n  email: p.email,\n  type: p.type,\n  completed_at: new Date().toISOString(),\n  package: dsarPackage,\n  suppression\n};\n\nawait patch('/rest/v1/dsar_requests?id=eq.' + enc(p.request_id), {\n  status: 'completed',\n  evidence\n});\n\nlet telegram_delivered = false;\nlet notice = null;\nif (p.telegram_token && p.telegram_chat) {\n  const text = [\n    'FlowOps DSAR completed',\n    'Type: ' + p.type,\n    'Tenant: ' + tenant.name,\n    'Subject: ' + p.email,\n    'Request: ' + p.request_id,\n    'Correlation: ' + p.correlation_id\n  ].join('\\n');\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.telegram.org/bot' + p.telegram_token + '/sendMessage',\n      body: { chat_id: p.telegram_chat, text },\n      json: true\n    });\n    telegram_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\n\nreturn [{ json: {\n  ok: true,\n  request_id: p.request_id,\n  tenant_id: p.tenant_id,\n  email: p.email,\n  type: p.type,\n  status: 'completed',\n  matched_seat_count: matchingSeats.length,\n  entitlement_count: (entitlements || []).length,\n  invoice_count: (invoices || []).length,\n  audit_count: (audits || []).length,\n  suppression,\n  telegram_delivered,\n  notice\n} }];"
+      },
+      "id": "fulfill-dsar",
+      "name": "Fulfill DSAR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $('Fulfill DSAR').first().json;\nreturn [{ json: {\n  tenant_id: result.tenant_id,\n  correlation_id: $('Normalize Request').first().json.correlation_id,\n  service: 'dsar',\n  step: 'fulfill',\n  status: result.ok ? 'success' : 'error',\n  payload: {\n    request_id: result.request_id,\n    email: result.email,\n    type: result.type,\n    status: result.status || 'rejected',\n    matched_seat_count: result.matched_seat_count || 0,\n    entitlement_count: result.entitlement_count || 0,\n    invoice_count: result.invoice_count || 0,\n    audit_count: result.audit_count || 0,\n    suppression: result.suppression || null,\n    telegram_delivered: result.telegram_delivered || false,\n    notice: result.notice || null,\n    evidence: result.evidence || null\n  }\n} }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Fulfilled",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Fulfilled",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2880,
+        800
+      ]
+    }
+  ],
+  "connections": {
+    "DSAR Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Entry": {
+      "main": [
+        [
+          {
+            "node": "Normalize Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Request": {
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Replay?": {
+      "main": [
+        [
+          {
+            "node": "Invalid Request?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs Webhook Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Webhook Response?": {
+      "main": [
+        [
+          {
+            "node": "Respond Received",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Invalid Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Received": {
+      "main": [
+        [
+          {
+            "node": "Invalid Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invalid Request?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Invalid": {
+      "main": [
+        [
+          {
+            "node": "Audit: Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Idempotency Input": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Fulfill DSAR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fulfill DSAR": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Fulfilled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Fulfilled": {
+      "main": [
+        [
+          {
+            "node": "Audit: Fulfilled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
+  ]
+}
