@@ -37,9 +37,10 @@ x-n8n-common: &n8n-common
     GITHUB_REPO: ${GITHUB_REPO:-}
     GITHUB_SLA_LABEL: ${GITHUB_SLA_LABEL:-sla-watch}
     GITHUB_SLA_HOURS: ${GITHUB_SLA_HOURS:-48}
-    # Service 6/7 batch defaults.
+    # Service 6/7/11 batch defaults.
     HEALTH_RISK_THRESHOLD: ${HEALTH_RISK_THRESHOLD:-70}
     RENEWAL_WINDOW_DAYS: ${RENEWAL_WINDOW_DAYS:-45}
+    COMPLIANCE_RETENTION_DAYS: ${COMPLIANCE_RETENTION_DAYS:-365}
     # G1 fetches the failed execution's runData back via the n8n REST API to recover
     # correlation_id + the original payload (the Error Trigger payload omits runData).
     # Internal URL = the main container over the compose network (workers run G1).

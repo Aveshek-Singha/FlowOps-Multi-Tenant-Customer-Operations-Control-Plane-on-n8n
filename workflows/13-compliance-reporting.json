@@ -1,0 +1,504 @@
+{
+  "name": "13-compliance-reporting",
+  "id": "a10b0000-0000-4000-8000-000000000014",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "compliance-report",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "compliance-webhook",
+      "name": "Compliance Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        260
+      ],
+      "webhookId": "compliance-report"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        500
+      ],
+      "notesInFlow": true,
+      "notes": "Contract B replay entry. Replays the original trigger with the same correlation_id."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "compliance-cron",
+      "name": "Compliance Daily Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        740
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst tenant_id = body.tenant_id || root.tenant_id || null;\nconst dayBucket = new Date().toISOString().slice(0, 10);\nconst event_id = body.event_id || body.run_id || ('compliance-' + (response_required ? 'manual-' : '') + (tenant_id || 'all') + '-' + dayBucket);\nconst retentionRaw = Number(body.retention_days);\nconst retentionDefault = Number($env.COMPLIANCE_RETENTION_DAYS) > 0 ? Number($env.COMPLIANCE_RETENTION_DAYS) : 365;\nconst retention_days = Number.isFinite(retentionRaw) && retentionRaw > 0 ? Math.min(Math.round(retentionRaw), 3650) : retentionDefault;\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\n\nreturn [{ json: {\n  tenant_id,\n  event_id,\n  retention_days,\n  idem_key: 'compliance:' + event_id,\n  replay,\n  response_required,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, '')\n} }];"
+      },
+      "id": "normalize",
+      "name": "Normalize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needs-response",
+              "leftValue": "={{ $json.response_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "needs-response",
+      "name": "Needs Webhook Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Run').item.json.correlation_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id || null, workflow: '13-compliance-reporting' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1340,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { tenant_id: p.tenant_id || null, correlation_id: p.correlation_id, service: 'compliance', step: 'build-export', status: 'skipped', payload: { reason: 'duplicate run', key: p.idem_key } } }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { tenant_id: p.tenant_id || null, correlation_id: p.correlation_id, service: 'compliance', step: 'build-export', status: 'started', payload: { source: p.replay ? 'replay' : 'scheduled-or-webhook', execution_id: p.execution_id, tenant_id: p.tenant_id || null } } }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nconst H = {\n  apikey: $env.SUPABASE_SERVICE_KEY,\n  Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY,\n  accept: 'application/json',\n  'content-type': 'application/json'\n};\nconst prefer = Object.assign({}, H, { Prefer: 'return=representation' });\nconst helpers = this.helpers;\nfunction enc(value) {\n  return encodeURIComponent(String(value));\n}\nasync function get(path) {\n  return await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: H, json: true });\n}\n// Paginated fetch: PostgREST caps responses (max-rows); Range pages prevent silent row drop.\nasync function getAll(path, pageSize = 1000) {\n  const out = [];\n  for (let from = 0; ; from += pageSize) {\n    const page = await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: Object.assign({}, H, { Range: from + '-' + (from + pageSize - 1), 'Range-Unit': 'items' }), json: true });\n    if (!Array.isArray(page) || page.length === 0) break;\n    out.push(...page);\n    if (page.length < pageSize) break;\n  }\n  return out;\n}\n// Exact server-side count without fetching rows (Content-Range: */N).\nasync function countWhere(path) {\n  const res = await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path + '&limit=1', headers: Object.assign({}, H, { Prefer: 'count=exact' }), json: true, returnFullResponse: true });\n  const cr = (res.headers && (res.headers['content-range'] || res.headers['Content-Range'])) || '';\n  const total = Number(String(cr).split('/')[1]);\n  return Number.isFinite(total) ? total : null;\n}\nasync function post(path, body) {\n  return await helpers.httpRequest({ method: 'POST', url: p.supabase_url + path, headers: prefer, body, json: true });\n}\n\nconst tenantFilter = p.tenant_id ? '&tenant_id=eq.' + enc(p.tenant_id) : '';\nconst audit = await get('/rest/v1/audit_log?select=tenant_id,correlation_id,service,step,status,payload,created_at' + tenantFilter + '&order=created_at.desc&limit=200');\nconst dlq = await get('/rest/v1/dead_letter_queue?select=id,tenant_id,correlation_id,workflow,error_class,status,attempts,created_at' + tenantFilter + '&order=created_at.desc&limit=100');\nconst dsar = await get('/rest/v1/dsar_requests?select=id,tenant_id,email,type,status,created_at' + tenantFilter + '&order=created_at.desc&limit=100');\nconst approvals = await get('/rest/v1/v_pending_approvals?select=tenant_id,tenant_name,correlation_id,service,step,created_at' + tenantFilter + '&limit=100');\nconst since = new Date(Date.now() - p.retention_days * 24 * 60 * 60 * 1000).toISOString();\n// Exact count of rows past retention (server-side); sampling the newest 200 rows\n// would systematically report 0 candidates.\nconst retentionCount = await countWhere('/rest/v1/audit_log?select=id' + tenantFilter + '&created_at=lt.' + enc(since));\n\nconst byStatus = {};\nfor (const row of audit || []) byStatus[row.status] = (byStatus[row.status] || 0) + 1;\nconst byService = {};\nfor (const row of audit || []) byService[row.service] = (byService[row.service] || 0) + 1;\nconst dlqByStatus = {};\nfor (const row of dlq || []) dlqByStatus[row.status] = (dlqByStatus[row.status] || 0) + 1;\nconst dsarByStatus = {};\nfor (const row of dsar || []) dsarByStatus[row.status] = (dsarByStatus[row.status] || 0) + 1;\n\nconst report = {\n  tenant_scope: p.tenant_id || 'all',\n  retention_days: p.retention_days,\n  generated_at: new Date().toISOString(),\n  audit: {\n    row_count: (audit || []).length,\n    by_status: byStatus,\n    by_service: byService\n  },\n  dlq: {\n    row_count: (dlq || []).length,\n    by_status: dlqByStatus,\n    // Data minimization: ids only. Raw error text/payloads stay out of this\n    // anon-readable table; the operator drills in via the DLQ UI.\n    manual_or_open_count: (dlq || []).filter((row) => ['open', 'manual'].includes(row.status)).length,\n    manual_or_open_ids: (dlq || []).filter((row) => ['open', 'manual'].includes(row.status)).slice(0, 20).map((row) => row.id)\n  },\n  dsar: {\n    row_count: (dsar || []).length,\n    by_status: dsarByStatus\n  },\n  approvals: {\n    pending_count: (approvals || []).length,\n    // Data minimization: service/step counts only; payload amounts + tenant names\n    // are readable via the RLS-scoped v_pending_approvals view instead.\n    pending_by_service: (approvals || []).reduce((acc, row) => { acc[row.service] = (acc[row.service] || 0) + 1; return acc; }, {})\n  },\n  retention: {\n    candidate_count: retentionCount != null ? retentionCount : 0,\n    count_exact: retentionCount != null,\n    cutoff: since,\n    mode: 'report-only'\n  }\n};\n\nconst md = [\n  '# FlowOps compliance export',\n  '',\n  '- Tenant scope: ' + report.tenant_scope,\n  '- Generated at: ' + report.generated_at,\n  '- Audit rows sampled: ' + report.audit.row_count,\n  '- DLQ rows sampled: ' + report.dlq.row_count,\n  '- Pending approvals: ' + report.approvals.pending_count,\n  '- DSAR rows sampled: ' + report.dsar.row_count,\n  '- Retention candidates: ' + report.retention.candidate_count + ' older than ' + p.retention_days + ' days',\n  '',\n  '## Audit by service',\n  JSON.stringify(report.audit.by_service, null, 2),\n  '',\n  '## DLQ by status',\n  JSON.stringify(report.dlq.by_status, null, 2)\n].join('\\n');\n\nconst rows = await post('/rest/v1/compliance_exports', [{\n  correlation_id: p.correlation_id,\n  tenant_id: p.tenant_id || null,\n  status: 'completed',\n  report_md: md,\n  report\n}]);\nconst exportRow = Array.isArray(rows) ? rows[0] : rows;\n\nlet telegram_delivered = false;\nlet notice = null;\nif (p.telegram_token && p.telegram_chat) {\n  const text = ['FlowOps compliance export', 'Scope: ' + report.tenant_scope, 'Audit rows: ' + report.audit.row_count, 'DLQ open/manual: ' + report.dlq.manual_or_open_count, 'Correlation: ' + p.correlation_id].join('\\n');\n  try {\n    await this.helpers.httpRequest({ method: 'POST', url: 'https://api.telegram.org/bot' + p.telegram_token + '/sendMessage', body: { chat_id: p.telegram_chat, text }, json: true });\n    telegram_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\n\nreturn [{ json: { export_id: exportRow && exportRow.id, tenant_id: p.tenant_id || null, correlation_id: p.correlation_id, report, report_md: md, telegram_delivered, notice } }];"
+      },
+      "id": "build-compliance-export",
+      "name": "Build Compliance Export",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $('Build Compliance Export').first().json;\nreturn [{ json: {\n  tenant_id: r.tenant_id,\n  correlation_id: r.correlation_id,\n  service: 'compliance',\n  step: 'export',\n  status: 'success',\n  payload: { export_id: r.export_id, tenant_scope: r.report.tenant_scope, audit_rows: r.report.audit.row_count, dlq_rows: r.report.dlq.row_count, pending_approvals: r.report.approvals.pending_count, retention_candidates: r.report.retention.candidate_count, telegram_delivered: r.telegram_delivered, notice: r.notice }\n} }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Export",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Export",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2660,
+        720
+      ]
+    }
+  ],
+  "connections": {
+    "Compliance Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Entry": {
+      "main": [
+        [
+          {
+            "node": "Normalize Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compliance Daily Cron": {
+      "main": [
+        [
+          {
+            "node": "Normalize Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Run": {
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Replay?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs Webhook Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Webhook Response?": {
+      "main": [
+        [
+          {
+            "node": "Respond Queued",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Queued": {
+      "main": [
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Idempotency Input": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Build Compliance Export",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Compliance Export": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Export",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Export": {
+      "main": [
+        [
+          {
+            "node": "Audit: Export",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
+  ]
+}
