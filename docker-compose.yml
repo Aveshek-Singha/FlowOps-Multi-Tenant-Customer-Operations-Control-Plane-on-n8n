@@ -30,6 +30,21 @@ x-n8n-common: &n8n-common
     N8N_DOMAIN: ${WEBHOOK_URL:-http://localhost:5678}
     # Telegram approver chat for HITL messages (Contract B onboarding).
     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    # Telegram bot token — G1 global-error handler alerts (Code-node HTTP, non-throwing).
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    # GitHub Issues back Service 4 support SLA scanning/escalation.
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    GITHUB_REPO: ${GITHUB_REPO:-}
+    GITHUB_SLA_LABEL: ${GITHUB_SLA_LABEL:-sla-watch}
+    GITHUB_SLA_HOURS: ${GITHUB_SLA_HOURS:-48}
+    # Service 6/7 batch defaults.
+    HEALTH_RISK_THRESHOLD: ${HEALTH_RISK_THRESHOLD:-70}
+    RENEWAL_WINDOW_DAYS: ${RENEWAL_WINDOW_DAYS:-45}
+    # G1 fetches the failed execution's runData back via the n8n REST API to recover
+    # correlation_id + the original payload (the Error Trigger payload omits runData).
+    # Internal URL = the main container over the compose network (workers run G1).
+    N8N_API_KEY: ${N8N_API_KEY:-}
+    N8N_INTERNAL_URL: ${N8N_INTERNAL_URL:-http://n8n-main:5678}
   depends_on:
     postgres:
       condition: service_healthy
