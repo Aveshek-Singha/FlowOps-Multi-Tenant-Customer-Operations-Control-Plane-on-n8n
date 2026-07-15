@@ -1,0 +1,435 @@
+{
+  "name": "07-support-sla-escalation",
+  "id": "a10b0000-0000-4000-8000-000000000008",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    { "name": "flowops" },
+    { "name": "service" }
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-sla",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "support-sla-webhook",
+      "name": "Support SLA Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 260],
+      "webhookId": "support-sla"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 520],
+      "notesInFlow": true,
+      "notes": "Contract B replay entry. 05-dlq-replay re-injects the original issue payload with replay:true and the same correlation_id."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "sla-cron",
+      "name": "SLA Scan Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 760],
+      "notesInFlow": true,
+      "notes": "Scheduled scan path. Uses GITHUB_REPO/GITHUB_TOKEN/GITHUB_SLA_LABEL and emits the oldest breached open issue."
+    },
+    {
+      "parameters": {
+        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nfunction labelNames(labels) {\n  if (!Array.isArray(labels)) return [];\n  return labels.map(l => typeof l === 'string' ? l : (l && l.name)).filter(Boolean);\n}\n\nfunction tenantFromLabels(labels) {\n  const hit = labelNames(labels).find(l => /^tenant:/i.test(l));\n  return hit ? hit.split(':').slice(1).join(':') : null;\n}\n\nfunction priorityFromLabels(labels) {\n  const names = labelNames(labels).map(l => l.toLowerCase());\n  if (names.includes('p0') || names.includes('critical')) return 'P0';\n  if (names.includes('p1') || names.includes('high')) return 'P1';\n  if (names.includes('p2')) return 'P2';\n  return 'P3';\n}\n\nfunction ageHours(createdAt) {\n  const t = createdAt ? Date.parse(createdAt) : NaN;\n  if (!Number.isFinite(t)) return 0;\n  return Math.max(0, Math.round((Date.now() - t) / 36e5));\n}\n\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst configuredRepo = body.repo || $env.GITHUB_REPO || '';\nconst thresholdHours = Number(body.sla_hours || $env.GITHUB_SLA_HOURS || 48);\nconst label = body.label || $env.GITHUB_SLA_LABEL || 'sla-watch';\nlet issue = body.issue || body;\n\nconst wantsScan = body.mode === 'scan' || (!root.body && !replay);\nif (wantsScan) {\n  if (!configuredRepo || !$env.GITHUB_TOKEN) return [];\n  const q = 'repo:' + configuredRepo + ' is:issue is:open label:\"' + label + '\" sort:created-asc';\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: 'https://api.github.com/search/issues',\n    qs: { q, per_page: 20 },\n    headers: { Authorization: 'Bearer ' + $env.GITHUB_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': 'flowops-n8n' },\n    json: true\n  });\n  const breached = (res.items || []).filter(i => ageHours(i.created_at) >= thresholdHours);\n  // Only emit issues with a resolvable tenant (tenant:<uuid> label); an unlabeled breached\n  // issue would throw at Prep Idempotency on every 30-min scan and spam the DLQ via G1.\n  const actionable = breached.filter(i => tenantFromLabels(i.labels || []));\n  if (actionable.length === 0) return [];\n  issue = actionable[0];\n}\n\nconst labels = issue.labels || body.labels || [];\nconst tenant_id = body.tenant_id || issue.tenant_id || tenantFromLabels(labels) || root.tenant_id || null;\nconst repo = body.repo || issue.repository_url?.split('/repos/')[1] || configuredRepo || null;\nconst issue_number = body.issue_number || issue.number || issue.issue_number || null;\nconst issue_url = body.issue_url || issue.html_url || issue.url || null;\nconst title = body.title || issue.title || 'Support issue nearing SLA breach';\nconst created_at = body.created_at || issue.created_at || null;\nconst updated_at = body.updated_at || issue.updated_at || null;\nconst age_h = Number(body.age_h != null ? body.age_h : ageHours(created_at));\nconst priority = body.priority || priorityFromLabels(labels);\nconst assignee = body.assignee || (issue.assignee && issue.assignee.login) || (Array.isArray(issue.assignees) && issue.assignees[0] && issue.assignees[0].login) || null;\nconst source = replay ? 'replay' : (wantsScan ? 'github-scan' : (body.source || 'github-webhook'));\nconst event_id = body.event_id || issue.node_id || issue.id || (repo && issue_number ? repo + '#' + issue_number + ':' + (updated_at || created_at || '') : null);\n// Scan-found breaches bucket by day so a still-breached issue re-alerts daily instead of never again.\nconst dayBucket = new Date().toISOString().slice(0, 10);\nconst idem_key = 'sla:' + (event_id || (tenant_id + ':' + issue_number + ':' + age_h)) + (wantsScan ? ':' + dayBucket : '');\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\n\nreturn [{ json: {\n  tenant_id,\n  repo,\n  issue_number,\n  issue_url,\n  title,\n  labels: labelNames(labels),\n  created_at,\n  updated_at,\n  age_h,\n  sla_hours: thresholdHours,\n  priority,\n  assignee,\n  source,\n  replay,\n  response_required,\n  event_id,\n  idem_key,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, '')\n} }];"
+      },
+      "id": "normalize",
+      "name": "Normalize Issue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 420]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needs-response",
+              "leftValue": "={{ $json.response_required }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "needs-response",
+      "name": "Needs Webhook Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 520]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Issue').item.json.correlation_id }) }}",
+        "options": { "responseCode": 202 }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nif (!p.tenant_id) throw new Error('sla: missing tenant_id (pass tenant_id or a tenant:<uuid> GitHub label)');\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id, workflow: '07-support-sla-escalation' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 520]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1340, 520]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'sla', step: 'scan-breach', status: 'skipped', payload: { reason: 'duplicate event', key: p.idem_key, issue: p.issue_number, repo: p.repo } } }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 340]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 340]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id } }];"
+      },
+      "id": "prep-resolve",
+      "name": "Prep Resolve Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 640]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000001",
+        "options": {}
+      },
+      "id": "resolve-policy",
+      "name": "Resolve Policy",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 640]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'sla', step: 'scan-breach', status: 'started', payload: { source: p.source, repo: p.repo, issue_number: p.issue_number, priority: p.priority, age_h: p.age_h, sla_hours: p.sla_hours, execution_id: p.execution_id } } }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 640]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2440, 640]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'sla', step: 'approve-escalation', status: 'waiting', payload: { tenant_name: pol.tenant_name, repo: p.repo, issue_number: p.issue_number, issue_url: p.issue_url, title: p.title, priority: p.priority, age_h: p.age_h, approver: pol.policy.approval.approver } } }];"
+      },
+      "id": "prep-audit-waiting",
+      "name": "Prep Audit: Waiting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 640]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-waiting",
+      "name": "Audit: Waiting",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2880, 640]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst text = [\n  'Support SLA escalation needed',\n  'Tenant: ' + (pol.tenant_name || p.tenant_id) + ' (' + (pol.plan || 'unknown') + ')',\n  'Issue: #' + p.issue_number + ' ' + p.title,\n  'Priority: ' + p.priority + ' | Age: ' + p.age_h + 'h',\n  'Approver: ' + pol.policy.approval.approver,\n  'Correlation: `' + p.correlation_id + '`'\n].join('\\n');\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\nif (token && chat) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.telegram.org/bot' + token + '/sendMessage',\n      body: {\n        chat_id: chat,\n        text,\n        parse_mode: 'Markdown',\n        reply_markup: { inline_keyboard: [[ { text: 'Approve', url: $execution.resumeUrl + '?decision=approve' }, { text: 'Reject', url: $execution.resumeUrl + '?decision=reject' } ]] }\n      },\n      json: true\n    });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\nreturn [{ json: { alert_delivered, notice } }];"
+      },
+      "id": "send-approval",
+      "name": "Send Approval Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 640]
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {
+          "limitWaitTime": true,
+          "limitType": "afterTimeInterval",
+          "resumeAmount": 4,
+          "resumeUnit": "hours"
+        }
+      },
+      "id": "wait-approval",
+      "name": "Wait For Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [3320, 640],
+      "webhookId": "sla-approval-resume"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "approved",
+              "leftValue": "={{ $json.query.decision }}",
+              "rightValue": "approve",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "approved",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3540, 640]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nlet github_comment_delivered = false;\nlet notice = null;\nif ($env.GITHUB_TOKEN && p.repo && p.issue_number) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.github.com/repos/' + p.repo + '/issues/' + p.issue_number + '/comments',\n      headers: { Authorization: 'Bearer ' + $env.GITHUB_TOKEN, Accept: 'application/vnd.github+json', 'User-Agent': 'flowops-n8n' },\n      body: { body: 'FlowOps SLA escalation approved for ' + (pol.tenant_name || p.tenant_id) + '. Correlation: ' + p.correlation_id },\n      json: true\n    });\n    github_comment_delivered = true;\n  } catch (e) {\n    notice = 'github comment failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'github comment skipped: GITHUB_TOKEN/repo/issue missing';\n}\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, github_comment_delivered, notice } }];"
+      },
+      "id": "post-github-comment",
+      "name": "Post GitHub Escalation Comment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst gh = $('Post GitHub Escalation Comment').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'sla', step: 'approve-escalation', status: 'success', payload: { decision: 'approved', tenant_name: pol.tenant_name, repo: p.repo, issue_number: p.issue_number, assignee: p.assignee, github_comment_delivered: gh.github_comment_delivered, notice: gh.notice } } }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3980, 520]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [4200, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'sla', step: 'approve-escalation', status: 'skipped', payload: { decision: 'rejected_or_timed_out', repo: p.repo, issue_number: p.issue_number } } }];"
+      },
+      "id": "prep-audit-skipped",
+      "name": "Prep Audit: Skipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3760, 760]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-skipped",
+      "name": "Audit: Skipped",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [3980, 760]
+    }
+  ],
+  "connections": {
+    "Support SLA Webhook": {
+      "main": [[{ "node": "Normalize Issue", "type": "main", "index": 0 }]]
+    },
+    "Replay Entry": {
+      "main": [[{ "node": "Normalize Issue", "type": "main", "index": 0 }]]
+    },
+    "SLA Scan Cron": {
+      "main": [[{ "node": "Normalize Issue", "type": "main", "index": 0 }]]
+    },
+    "Normalize Issue": {
+      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+    },
+    "Is Replay?": {
+      "main": [
+        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }],
+        [{ "node": "Needs Webhook Response?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Needs Webhook Response?": {
+      "main": [
+        [{ "node": "Respond Queued", "type": "main", "index": 0 }],
+        [{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Respond Queued": {
+      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+    },
+    "Prep Idempotency Input": {
+      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+    },
+    "Idempotency Check": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+    },
+    "Prep Resolve Input": {
+      "main": [[{ "node": "Resolve Policy", "type": "main", "index": 0 }]]
+    },
+    "Resolve Policy": {
+      "main": [[{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Started": {
+      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+    },
+    "Audit: Started": {
+      "main": [[{ "node": "Prep Audit: Waiting", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Waiting": {
+      "main": [[{ "node": "Audit: Waiting", "type": "main", "index": 0 }]]
+    },
+    "Audit: Waiting": {
+      "main": [[{ "node": "Send Approval Request", "type": "main", "index": 0 }]]
+    },
+    "Send Approval Request": {
+      "main": [[{ "node": "Wait For Approval", "type": "main", "index": 0 }]]
+    },
+    "Wait For Approval": {
+      "main": [[{ "node": "Approved?", "type": "main", "index": 0 }]]
+    },
+    "Approved?": {
+      "main": [
+        [{ "node": "Post GitHub Escalation Comment", "type": "main", "index": 0 }],
+        [{ "node": "Prep Audit: Skipped", "type": "main", "index": 0 }]
+      ]
+    },
+    "Post GitHub Escalation Comment": {
+      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Success": {
+      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Skipped": {
+      "main": [[{ "node": "Audit: Skipped", "type": "main", "index": 0 }]]
+    }
+  }
+}
