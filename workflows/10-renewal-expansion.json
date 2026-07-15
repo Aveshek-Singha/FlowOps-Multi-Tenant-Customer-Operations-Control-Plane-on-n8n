@@ -1,0 +1,307 @@
+{
+  "name": "10-renewal-expansion",
+  "id": "a10b0000-0000-4000-8000-000000000011",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    { "name": "flowops" },
+    { "name": "service" }
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "renewal-expansion",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "renewal-webhook",
+      "name": "Renewal Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 260],
+      "webhookId": "renewal-expansion"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 520],
+      "notesInFlow": true,
+      "notes": "Contract B replay entry. Replays the original renewal run with the same correlation_id."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "renewal-cron",
+      "name": "Renewal Daily Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 760]
+    },
+    {
+      "parameters": {
+        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst window_days = Number(body.window_days || $env.RENEWAL_WINDOW_DAYS || 45);\nconst dateBucket = new Date().toISOString().slice(0, 10);\nconst tenant_id = body.tenant_id || root.tenant_id || null;\nconst event_id = body.event_id || body.run_id || ('renewal-' + (response_required ? 'manual-' : '') + (tenant_id || 'batch') + '-' + dateBucket);\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\nreturn [{ json: {\n  tenant_id,\n  event_id,\n  idem_key: 'renewal:' + event_id,\n  window_days,\n  force: !!body.force || !!tenant_id,\n  replay,\n  response_required,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, '')\n} }];"
+      },
+      "id": "normalize",
+      "name": "Normalize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 500]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 500]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needs-response",
+              "leftValue": "={{ $json.response_required }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "needs-response",
+      "name": "Needs Webhook Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 620]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Run').item.json.correlation_id }) }}",
+        "options": { "responseCode": 202 }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id, workflow: '10-renewal-expansion' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 620]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1340, 620]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 620]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'renewal', step: 'build-package', status: 'skipped', payload: { reason: 'duplicate run', key: p.idem_key } } }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 420]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'renewal', step: 'build-package', status: 'started', payload: { source: p.replay ? 'replay' : 'scheduled-or-webhook', window_days: p.window_days, force: p.force, execution_id: p.execution_id } } }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 720]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nconst H = { apikey: $env.SUPABASE_SERVICE_KEY, Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY, accept: 'application/json' };\nconst J = { ...H, 'Content-Type': 'application/json', Prefer: 'return=representation' };\nconst helpers = this.helpers;\nasync function get(path) {\n  return await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: H, json: true });\n}\nasync function post(path, body) {\n  return await helpers.httpRequest({ method: 'POST', url: p.supabase_url + path, headers: J, body, json: true });\n}\nfunction addDays(d, days) {\n  const x = new Date(d);\n  x.setUTCDate(x.getUTCDate() + days);\n  return x;\n}\nfunction nextAnnual(createdAt) {\n  const created = new Date(createdAt);\n  const now = new Date();\n  let due = new Date(Date.UTC(now.getUTCFullYear(), created.getUTCMonth(), created.getUTCDate()));\n  if (due < now) due = new Date(Date.UTC(now.getUTCFullYear() + 1, created.getUTCMonth(), created.getUTCDate()));\n  return due;\n}\nfunction riskLevel(tenant, risks) {\n  const score = Number(tenant.health_score || 100);\n  if (score < 40 || risks.some(r => r.status === 'error')) return 'critical';\n  if (score < 60 || risks.length >= 2) return 'high';\n  if (score < 80 || risks.length === 1) return 'watch';\n  return 'low';\n}\nconst tenantFilter = p.tenant_id ? ('id=eq.' + p.tenant_id + '&') : '';\nconst tenants = await get('/rest/v1/tenants?' + tenantFilter + 'status=eq.active&select=id,name,plan,region,status,health_score,created_at');\nconst now = new Date();\nconst windowEnd = addDays(now, p.window_days);\nconst selected = (tenants || []).filter(t => {\n  const due = nextAnnual(t.created_at);\n  return p.force || due <= windowEnd;\n});\nconst packages = [];\nfor (const tenant of selected) {\n  const due = nextAnnual(tenant.created_at);\n  // One live package per (tenant, due date): daily cron / manual re-runs with fresh\n  // event_ids would otherwise stack identical draft/scheduled rows.\n  const existing = await get('/rest/v1/renewal_packages?tenant_id=eq.' + tenant.id + '&renewal_due_at=eq.' + encodeURIComponent(due.toISOString()) + '&status=in.(draft,scheduled)&select=id&limit=1');\n  if (Array.isArray(existing) && existing.length > 0) {\n    packages.push({ tenant_id: tenant.id, tenant_name: tenant.name, renewal_due_at: due.toISOString(), risk_level: null, status: 'already-exists', package_id: existing[0].id });\n    continue;\n  }\n  // The three per-tenant reads are independent -> fetch concurrently.\n  const [audit, invoices, ents] = await Promise.all([\n    get('/rest/v1/audit_log?tenant_id=eq.' + tenant.id + '&select=service,step,status,payload,created_at&order=created_at.desc&limit=25'),\n    get('/rest/v1/invoices?tenant_id=eq.' + tenant.id + '&select=stripe_id,status,amount,attempt,created_at&order=created_at.desc&limit=10'),\n    get('/rest/v1/entitlements?tenant_id=eq.' + tenant.id + '&select=feature,enabled')\n  ]);\n  // Only recent problems poison the risk level; a transient error weeks ago must not\n  // flip renewal strategy forever.\n  const riskCutoff = Date.now() - 14 * 86400000;\n  const risks = (audit || []).filter(a => (a.status === 'waiting' || a.status === 'error') && Date.parse(a.created_at) >= riskCutoff);\n  const level = riskLevel(tenant, risks);\n  const md = [\n    '# Renewal package: ' + tenant.name,\n    '',\n    '- Tenant: ' + tenant.id,\n    '- Plan: ' + tenant.plan,\n    '- Region: ' + tenant.region,\n    '- Health score: ' + tenant.health_score,\n    '- Renewal due: ' + due.toISOString(),\n    '- Risk level: ' + level,\n    '- Open risks: ' + risks.length,\n    '- Recent invoices: ' + (invoices || []).length,\n    '- Enabled entitlements: ' + (ents || []).filter(e => e.enabled).map(e => e.feature).join(', '),\n    '',\n    'Recommended outreach: ' + (level === 'critical' || level === 'high' ? 'CSM save-plan before renewal ask.' : 'Expansion conversation with health proof points.')\n  ].join('\\n');\n  const pkg = { tenant, renewal_due_at: due.toISOString(), risks, invoices, entitlements: ents, recommendation: level === 'critical' || level === 'high' ? 'save-plan' : 'expansion-outreach' };\n  const row = await post('/rest/v1/renewal_packages', {\n    tenant_id: tenant.id,\n    correlation_id: p.correlation_id,\n    renewal_due_at: due.toISOString(),\n    risk_level: level,\n    status: level === 'critical' ? 'draft' : 'scheduled',\n    package_md: md,\n    package: pkg\n  });\n  packages.push({ tenant_id: tenant.id, tenant_name: tenant.name, renewal_due_at: due.toISOString(), risk_level: level, status: Array.isArray(row) && row[0] ? row[0].status : null, package_id: Array.isArray(row) && row[0] ? row[0].id : null });\n}\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, package_count: packages.length, packages, generated_at: new Date().toISOString() } }];"
+      },
+      "id": "build-packages",
+      "name": "Build Renewal Packages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $('Build Renewal Packages').first().json;\nconst text = ['FlowOps renewal run', 'Packages: ' + b.package_count, 'Correlation: `' + b.correlation_id + '`', ''].concat((b.packages || []).map(p => p.tenant_name + ': ' + p.risk_level + ' -> ' + p.status)).join('\\n');\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\nif (token && chat && b.package_count > 0) {\n  try {\n    await this.helpers.httpRequest({ method: 'POST', url: 'https://api.telegram.org/bot' + token + '/sendMessage', body: { chat_id: chat, text, parse_mode: 'Markdown' }, json: true });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else if (b.package_count === 0) {\n  notice = 'telegram skipped: no renewal packages';\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\nreturn [{ json: { ...b, alert_delivered, notice } }];"
+      },
+      "id": "notify-telegram",
+      "name": "Notify Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const n = $('Notify Telegram').first().json;\nreturn [{ json: { tenant_id: n.tenant_id, correlation_id: n.correlation_id, service: 'renewal', step: 'schedule-outreach', status: 'success', payload: { package_count: n.package_count, packages: n.packages, telegram_delivered: n.alert_delivered, notice: n.notice } } }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 720]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2880, 720]
+    }
+  ],
+  "connections": {
+    "Renewal Webhook": {
+      "main": [[{ "node": "Normalize Run", "type": "main", "index": 0 }]]
+    },
+    "Replay Entry": {
+      "main": [[{ "node": "Normalize Run", "type": "main", "index": 0 }]]
+    },
+    "Renewal Daily Cron": {
+      "main": [[{ "node": "Normalize Run", "type": "main", "index": 0 }]]
+    },
+    "Normalize Run": {
+      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+    },
+    "Is Replay?": {
+      "main": [
+        [{ "node": "Prep Audit: Started", "type": "main", "index": 0 }],
+        [{ "node": "Needs Webhook Response?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Needs Webhook Response?": {
+      "main": [
+        [{ "node": "Respond Queued", "type": "main", "index": 0 }],
+        [{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Respond Queued": {
+      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+    },
+    "Prep Idempotency Input": {
+      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+    },
+    "Idempotency Check": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Started": {
+      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+    },
+    "Audit: Started": {
+      "main": [[{ "node": "Build Renewal Packages", "type": "main", "index": 0 }]]
+    },
+    "Build Renewal Packages": {
+      "main": [[{ "node": "Notify Telegram", "type": "main", "index": 0 }]]
+    },
+    "Notify Telegram": {
+      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Success": {
+      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+    }
+  }
+}

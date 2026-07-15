@@ -1,0 +1,307 @@
+{
+  "name": "09-health-churn-risk",
+  "id": "a10b0000-0000-4000-8000-000000000010",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    { "name": "flowops" },
+    { "name": "service" }
+  ],
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "health-risk",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "health-webhook",
+      "name": "Health Risk Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 260],
+      "webhookId": "health-risk"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [0, 520],
+      "notesInFlow": true,
+      "notes": "Contract B replay entry. Replays the original health scan trigger with the same correlation_id."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "health-cron",
+      "name": "Health Scan Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 760]
+    },
+    {
+      "parameters": {
+        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst now = new Date();\nconst hourBucket = now.toISOString().slice(0, 13);\nconst event_id = body.event_id || body.run_id || ('health-scan-' + (response_required ? 'manual-' : '') + hourBucket);\nconst threshold = Number(body.threshold || $env.HEALTH_RISK_THRESHOLD || 70);\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\n\nreturn [{ json: {\n  event_id,\n  idem_key: 'health:' + event_id,\n  threshold,\n  replay,\n  response_required,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, '')\n} }];"
+      },
+      "id": "normalize",
+      "name": "Normalize Run",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 500]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 500]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needs-response",
+              "leftValue": "={{ $json.response_required }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "needs-response",
+      "name": "Needs Webhook Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 620]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Run').item.json.correlation_id }) }}",
+        "options": { "responseCode": 202 }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { key: p.idem_key, tenant_id: null, workflow: '09-health-churn-risk' } }];"
+      },
+      "id": "prep-idempotency",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 620]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [1340, 620]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 620]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { tenant_id: null, correlation_id: p.correlation_id, service: 'health', step: 'scan-risk', status: 'skipped', payload: { reason: 'duplicate scan', key: p.idem_key } } }];"
+      },
+      "id": "prep-audit-dup",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 420]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-dup",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nreturn [{ json: { tenant_id: null, correlation_id: p.correlation_id, service: 'health', step: 'scan-risk', status: 'started', payload: { source: p.replay ? 'replay' : 'scheduled-or-webhook', threshold: p.threshold, execution_id: p.execution_id } } }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 720]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2000, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Run').first().json;\nconst H = { apikey: $env.SUPABASE_SERVICE_KEY, Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY, accept: 'application/json' };\nconst helpers = this.helpers;\nasync function get(path) {\n  return await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: H, json: true });\n}\nconst tenants = await get('/rest/v1/tenants?status=eq.active&select=id,name,plan,region,status,health_score');\nconst signals = await get('/rest/v1/v_health_latest?select=tenant_id,tenant_name,metric,latest_value,prev_value,delta,latest_ts');\nconst byTenant = new Map();\nfor (const t of tenants || []) byTenant.set(t.id, { tenant: t, signals: [] });\nfor (const s of signals || []) {\n  if (!byTenant.has(s.tenant_id)) continue;\n  byTenant.get(s.tenant_id).signals.push(s);\n}\nfunction n(v, fallback = 0) {\n  const x = Number(v);\n  return Number.isFinite(x) ? x : fallback;\n}\nfunction classify(tenant, sigs) {\n  const reasons = [];\n  let score = n(tenant.health_score, 100);\n  for (const s of sigs) {\n    const latest = n(s.latest_value, 0);\n    const delta = n(s.delta, 0);\n    if (s.metric === 'login_frequency' && (latest <= 5 || delta <= -8)) reasons.push('login drop');\n    if (s.metric === 'feature_usage' && (latest <= 15 || delta <= -20)) reasons.push('feature usage drop');\n    if (s.metric === 'ticket_volume' && (latest >= 10 || delta >= 5)) reasons.push('ticket volume spike');\n  }\n  let level = 'low';\n  if (score < 40 || reasons.length >= 2) level = 'critical';\n  else if (score < 55 || reasons.length === 1) level = 'high';\n  else if (score < p.threshold) level = 'watch';\n  return { level, reasons };\n}\nconst risks = [];\nfor (const item of byTenant.values()) {\n  const c = classify(item.tenant, item.signals);\n  if (c.level === 'low') continue;\n  risks.push({\n    tenant_id: item.tenant.id,\n    tenant_name: item.tenant.name,\n    plan: item.tenant.plan,\n    region: item.tenant.region,\n    health_score: item.tenant.health_score,\n    risk_level: c.level,\n    reasons: c.reasons,\n    playbook: c.level === 'critical' ? 'exec-save-plan' : (c.level === 'high' ? 'csm-risk-review' : 'watchlist'),\n    signals: item.signals.map(s => ({ metric: s.metric, latest_value: s.latest_value, prev_value: s.prev_value, delta: s.delta }))\n  });\n}\nconst riskRank = { critical: 0, high: 1, watch: 2 };\nrisks.sort((a, b) => (riskRank[a.risk_level] ?? 9) - (riskRank[b.risk_level] ?? 9));\nreturn [{ json: { tenant_id: null, correlation_id: p.correlation_id, risk_count: risks.length, risks, generated_at: new Date().toISOString() } }];"
+      },
+      "id": "scan-health",
+      "name": "Scan Health Risks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $('Scan Health Risks').first().json;\nconst top = (s.risks || []).slice(0, 5);\nconst text = ['FlowOps health scan', 'Risks: ' + s.risk_count, 'Correlation: `' + s.correlation_id + '`', ''].concat(top.map(r => r.risk_level.toUpperCase() + ': ' + r.tenant_name + ' - ' + r.reasons.join(', ') + ' -> ' + r.playbook)).join('\\n');\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\nif (token && chat && s.risk_count > 0) {\n  try {\n    await this.helpers.httpRequest({ method: 'POST', url: 'https://api.telegram.org/bot' + token + '/sendMessage', body: { chat_id: chat, text, parse_mode: 'Markdown' }, json: true });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else if (s.risk_count === 0) {\n  notice = 'telegram skipped: no risks';\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\nreturn [{ json: { alert_delivered, notice, risk_count: s.risk_count, risks: s.risks, correlation_id: s.correlation_id } }];"
+      },
+      "id": "notify-telegram",
+      "name": "Notify Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const n = $('Notify Telegram').first().json;\nreturn [{ json: { tenant_id: null, correlation_id: n.correlation_id, service: 'health', step: 'route-playbook', status: 'success', payload: { risk_count: n.risk_count, risks: n.risks, telegram_delivered: n.alert_delivered, notice: n.notice } } }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 720]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2880, 720]
+    }
+  ],
+  "connections": {
+    "Health Risk Webhook": {
+      "main": [[{ "node": "Normalize Run", "type": "main", "index": 0 }]]
+    },
+    "Replay Entry": {
+      "main": [[{ "node": "Normalize Run", "type": "main", "index": 0 }]]
+    },
+    "Health Scan Cron": {
+      "main": [[{ "node": "Normalize Run", "type": "main", "index": 0 }]]
+    },
+    "Normalize Run": {
+      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+    },
+    "Is Replay?": {
+      "main": [
+        [{ "node": "Prep Audit: Started", "type": "main", "index": 0 }],
+        [{ "node": "Needs Webhook Response?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Needs Webhook Response?": {
+      "main": [
+        [{ "node": "Respond Queued", "type": "main", "index": 0 }],
+        [{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Respond Queued": {
+      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+    },
+    "Prep Idempotency Input": {
+      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+    },
+    "Idempotency Check": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Started": {
+      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+    },
+    "Audit: Started": {
+      "main": [[{ "node": "Scan Health Risks", "type": "main", "index": 0 }]]
+    },
+    "Scan Health Risks": {
+      "main": [[{ "node": "Notify Telegram", "type": "main", "index": 0 }]]
+    },
+    "Notify Telegram": {
+      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+    },
+    "Prep Audit: Success": {
+      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+    }
+  }
+}
