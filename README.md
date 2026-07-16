@@ -50,10 +50,10 @@ A zero-cost, open-source reimplementation of an enterprise customer-ops platform
   └──────────┘              └─────────────────────┘          └────────────┘
 ```
 
-<!-- TEAMMATE: add UI + observability sections below this line. -->
+<!-- UI + observability sections to be added below as the frontend and Grafana stack land (solo build — same author). -->
 
 ---
 
 ## Status
 
-🚧 Under construction — Day 1. See `FlowOps - Full Plan.md` and `FlowOps - Team Plan & Task Division.md` for the build plan.
+🚧 Under construction — solo build (originally planned as a 2-person project; single-owner as of 2026-07-15). All 11 service workflows + backbone + reliability layer + approval reminder/escalation cron shipped; frontend + observability next. See `FlowOps - Full Plan.md` and `FlowOps - Team Plan & Task Division.md` (the solo plan) for the build plan.

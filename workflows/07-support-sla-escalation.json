@@ -7,8 +7,12 @@
     "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
   },
   "tags": [
-    { "name": "flowops" },
-    { "name": "service" }
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
   ],
   "nodes": [
     {
@@ -22,7 +26,10 @@
       "name": "Support SLA Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [0, 260],
+      "position": [
+        0,
+        260
+      ],
       "webhookId": "support-sla"
     },
     {
@@ -31,7 +38,10 @@
       "name": "Replay Entry",
       "type": "n8n-nodes-base.executeWorkflowTrigger",
       "typeVersion": 1,
-      "position": [0, 520],
+      "position": [
+        0,
+        520
+      ],
       "notesInFlow": true,
       "notes": "Contract B replay entry. 05-dlq-replay re-injects the original issue payload with replay:true and the same correlation_id."
     },
@@ -50,7 +60,10 @@
       "name": "SLA Scan Cron",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [0, 760],
+      "position": [
+        0,
+        760
+      ],
       "notesInFlow": true,
       "notes": "Scheduled scan path. Uses GITHUB_REPO/GITHUB_TOKEN/GITHUB_SLA_LABEL and emits the oldest breached open issue."
     },
@@ -62,19 +75,29 @@
       "name": "Normalize Issue",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [240, 420]
+      "position": [
+        240,
+        420
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "is-replay",
               "leftValue": "={{ $json.replay }}",
               "rightValue": true,
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -84,19 +107,29 @@
       "name": "Is Replay?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [460, 420]
+      "position": [
+        460,
+        420
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "needs-response",
               "leftValue": "={{ $json.response_required }}",
               "rightValue": true,
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -106,19 +139,27 @@
       "name": "Needs Webhook Response?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [680, 520]
+      "position": [
+        680,
+        520
+      ]
     },
     {
       "parameters": {
         "respondWith": "json",
         "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Issue').item.json.correlation_id }) }}",
-        "options": { "responseCode": 202 }
+        "options": {
+          "responseCode": 202
+        }
       },
       "id": "respond-queued",
       "name": "Respond Queued",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [900, 420]
+      "position": [
+        900,
+        420
+      ]
     },
     {
       "parameters": {
@@ -128,7 +169,10 @@
       "name": "Prep Idempotency Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1120, 520]
+      "position": [
+        1120,
+        520
+      ]
     },
     {
       "parameters": {
@@ -139,19 +183,29 @@
       "name": "Idempotency Check",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [1340, 520]
+      "position": [
+        1340,
+        520
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "is-dup",
               "leftValue": "={{ $json.dup }}",
               "rightValue": true,
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -161,7 +215,10 @@
       "name": "Is Duplicate?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [1560, 520]
+      "position": [
+        1560,
+        520
+      ]
     },
     {
       "parameters": {
@@ -171,7 +228,10 @@
       "name": "Prep Audit: Duplicate",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1780, 340]
+      "position": [
+        1780,
+        340
+      ]
     },
     {
       "parameters": {
@@ -182,7 +242,10 @@
       "name": "Audit: Duplicate",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [2000, 340]
+      "position": [
+        2000,
+        340
+      ]
     },
     {
       "parameters": {
@@ -192,7 +255,10 @@
       "name": "Prep Resolve Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1780, 640]
+      "position": [
+        1780,
+        640
+      ]
     },
     {
       "parameters": {
@@ -203,7 +269,10 @@
       "name": "Resolve Policy",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [2000, 640]
+      "position": [
+        2000,
+        640
+      ]
     },
     {
       "parameters": {
@@ -213,7 +282,10 @@
       "name": "Prep Audit: Started",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2220, 640]
+      "position": [
+        2220,
+        640
+      ]
     },
     {
       "parameters": {
@@ -224,67 +296,28 @@
       "name": "Audit: Started",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [2440, 640]
-    },
-    {
-      "parameters": {
-        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'sla', step: 'approve-escalation', status: 'waiting', payload: { tenant_name: pol.tenant_name, repo: p.repo, issue_number: p.issue_number, issue_url: p.issue_url, title: p.title, priority: p.priority, age_h: p.age_h, approver: pol.policy.approval.approver } } }];"
-      },
-      "id": "prep-audit-waiting",
-      "name": "Prep Audit: Waiting",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [2660, 640]
-    },
-    {
-      "parameters": {
-        "workflowId": "a10b0000-0000-4000-8000-000000000002",
-        "options": {}
-      },
-      "id": "audit-waiting",
-      "name": "Audit: Waiting",
-      "type": "n8n-nodes-base.executeWorkflow",
-      "typeVersion": 1,
-      "position": [2880, 640]
-    },
-    {
-      "parameters": {
-        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst text = [\n  'Support SLA escalation needed',\n  'Tenant: ' + (pol.tenant_name || p.tenant_id) + ' (' + (pol.plan || 'unknown') + ')',\n  'Issue: #' + p.issue_number + ' ' + p.title,\n  'Priority: ' + p.priority + ' | Age: ' + p.age_h + 'h',\n  'Approver: ' + pol.policy.approval.approver,\n  'Correlation: `' + p.correlation_id + '`'\n].join('\\n');\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\nif (token && chat) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.telegram.org/bot' + token + '/sendMessage',\n      body: {\n        chat_id: chat,\n        text,\n        parse_mode: 'Markdown',\n        reply_markup: { inline_keyboard: [[ { text: 'Approve', url: $execution.resumeUrl + '?decision=approve' }, { text: 'Reject', url: $execution.resumeUrl + '?decision=reject' } ]] }\n      },\n      json: true\n    });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\nreturn [{ json: { alert_delivered, notice } }];"
-      },
-      "id": "send-approval",
-      "name": "Send Approval Request",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [3100, 640]
-    },
-    {
-      "parameters": {
-        "resume": "webhook",
-        "options": {
-          "limitWaitTime": true,
-          "limitType": "afterTimeInterval",
-          "resumeAmount": 4,
-          "resumeUnit": "hours"
-        }
-      },
-      "id": "wait-approval",
-      "name": "Wait For Approval",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1.1,
-      "position": [3320, 640],
-      "webhookId": "sla-approval-resume"
+      "position": [
+        2440,
+        640
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "approved",
-              "leftValue": "={{ $json.query.decision }}",
+              "leftValue": "={{ $json.decision }}",
               "rightValue": "approve",
-              "operator": { "type": "string", "operation": "equals" }
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
             }
           ]
         },
@@ -294,7 +327,10 @@
       "name": "Approved?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [3540, 640]
+      "position": [
+        3540,
+        640
+      ]
     },
     {
       "parameters": {
@@ -304,7 +340,10 @@
       "name": "Post GitHub Escalation Comment",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3760, 520]
+      "position": [
+        3760,
+        520
+      ]
     },
     {
       "parameters": {
@@ -314,7 +353,10 @@
       "name": "Prep Audit: Success",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3980, 520]
+      "position": [
+        3980,
+        520
+      ]
     },
     {
       "parameters": {
@@ -325,7 +367,10 @@
       "name": "Audit: Success",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [4200, 520]
+      "position": [
+        4200,
+        520
+      ]
     },
     {
       "parameters": {
@@ -335,7 +380,10 @@
       "name": "Prep Audit: Skipped",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3760, 760]
+      "position": [
+        3760,
+        760
+      ]
     },
     {
       "parameters": {
@@ -346,90 +394,298 @@
       "name": "Audit: Skipped",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [3980, 760]
+      "position": [
+        3980,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Issue').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst approval = (pol.policy && pol.policy.approval) || {};\nconst text = [\n  'Support SLA escalation needed',\n  'Tenant: ' + (pol.tenant_name || p.tenant_id) + ' (' + (pol.plan || 'unknown') + ')',\n  'Issue: #' + p.issue_number + ' ' + p.title,\n  'Priority: ' + p.priority + ' | Age: ' + p.age_h + 'h',\n  'Approver: ' + (approval.approver || 'n/a'),\n  'Correlation: `' + p.correlation_id + '`'\n].join('\\n');\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'sla',\n  step: 'approve-escalation',\n  text,\n  parse_mode: 'Markdown',\n  timeout_hours: 4,\n  approver: approval.approver || null,\n  second_approver: approval.second_approver || null,\n  payload: {\n    tenant_name: pol.tenant_name,\n    repo: p.repo,\n    issue_number: p.issue_number,\n    issue_url: p.issue_url,\n    title: p.title,\n    priority: p.priority,\n    age_h: p.age_h,\n    approver: approval.approver || null,\n    second_approver: approval.second_approver || null\n  }\n} }];"
+      },
+      "id": "prep-telegram-approval",
+      "name": "Prep Telegram Approval Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000017",
+        "options": {}
+      },
+      "id": "telegram-approve",
+      "name": "Telegram Approve",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2880,
+        640
+      ]
     }
   ],
   "connections": {
     "Support SLA Webhook": {
-      "main": [[{ "node": "Normalize Issue", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalize Issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Replay Entry": {
-      "main": [[{ "node": "Normalize Issue", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalize Issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "SLA Scan Cron": {
-      "main": [[{ "node": "Normalize Issue", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalize Issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Normalize Issue": {
-      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Is Replay?": {
       "main": [
-        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }],
-        [{ "node": "Needs Webhook Response?", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs Webhook Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Needs Webhook Response?": {
       "main": [
-        [{ "node": "Respond Queued", "type": "main", "index": 0 }],
-        [{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Respond Queued",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Respond Queued": {
-      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Idempotency Input": {
-      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Idempotency Check": {
-      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Is Duplicate?": {
       "main": [
-        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
-        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Prep Audit: Duplicate": {
-      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Resolve Input": {
-      "main": [[{ "node": "Resolve Policy", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Resolve Policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Resolve Policy": {
-      "main": [[{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Started": {
-      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Audit: Started": {
-      "main": [[{ "node": "Prep Audit: Waiting", "type": "main", "index": 0 }]]
-    },
-    "Prep Audit: Waiting": {
-      "main": [[{ "node": "Audit: Waiting", "type": "main", "index": 0 }]]
-    },
-    "Audit: Waiting": {
-      "main": [[{ "node": "Send Approval Request", "type": "main", "index": 0 }]]
-    },
-    "Send Approval Request": {
-      "main": [[{ "node": "Wait For Approval", "type": "main", "index": 0 }]]
-    },
-    "Wait For Approval": {
-      "main": [[{ "node": "Approved?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Telegram Approval Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Approved?": {
       "main": [
-        [{ "node": "Post GitHub Escalation Comment", "type": "main", "index": 0 }],
-        [{ "node": "Prep Audit: Skipped", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Post GitHub Escalation Comment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Audit: Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Post GitHub Escalation Comment": {
-      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Success": {
-      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Skipped": {
-      "main": [[{ "node": "Audit: Skipped", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Telegram Approval Input": {
+      "main": [
+        [
+          {
+            "node": "Telegram Approve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Approve": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   }
 }

@@ -1,0 +1,112 @@
+{
+  "name": "04-global-error-handler",
+  "id": "a10b0000-0000-4000-8000-000000000005",
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "tags": [{ "name": "flowops" }, { "name": "reliability" }],
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.N8N_INTERNAL_URL }}/api/v1/executions/{{ $json.execution.id }}?includeData=true",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-API-KEY", "value": "={{ $env.N8N_API_KEY }}" },
+            { "name": "accept", "value": "application/json" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fetch-execution",
+      "name": "Fetch Execution",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 300],
+      "onError": "continueRegularOutput",
+      "notesInFlow": true,
+      "notes": "Error Trigger carries no runData. Fetch it back so we can recover correlation_id + the original payload for replay. Never blocks the DLQ write."
+    },
+    {
+      "parameters": {
+        "jsCode": "// G1: reconstruct failure context from the Error Trigger summary + the fetched runData.\n// The Error Trigger payload has NO runData, so correlation_id / tenant_id / the original\n// trigger payload can only come from the execution we fetched via the n8n API.\nconst et = $('Error Trigger').first().json || {};\nconst fetched = $('Fetch Execution').first().json || {};\n\nconst exec = et.execution || {};\nconst wf = et.workflow || {};\nconst err = exec.error || {};\n\nconst workflow_name = wf.name || 'unknown';\nconst workflow_id = wf.id || null;\nconst failed_node = exec.lastNodeExecuted || null;\nconst execution_id = exec.id || null;\nconst error_name = err.name || null;\nconst error_message = err.message || (failed_node ? ('Execution failed at ' + failed_node) : 'Unknown error');\nconst error_stack = err.stack || '';\n\n// runData is absent if the fetch failed (continueRegularOutput) — degrade to nulls.\nconst runData = (fetched.data && fetched.data.resultData && fetched.data.resultData.runData) || {};\n\nlet correlation_id = null;\nlet tenant_id = null;\nlet trigger_payload = {};\n\nfor (const nodeName of Object.keys(runData)) {\n  const runs = runData[nodeName] || [];\n  for (const run of runs) {\n    const branches = (run && run.data && run.data.main) || [];\n    for (const branch of branches) {\n      for (const item of (branch || [])) {\n        const j = (item && item.json) || {};\n        if (!correlation_id && j.correlation_id) correlation_id = j.correlation_id;\n        if (!tenant_id && j.tenant_id) tenant_id = j.tenant_id;\n        // First inbound body wins — that's the original event to replay (Contract B).\n        if (Object.keys(trigger_payload).length === 0 && j.body && typeof j.body === 'object') {\n          trigger_payload = j.body;\n        }\n      }\n    }\n  }\n}\n\n// dead_letter_queue.correlation_id is uuid (nullable). Drop anything non-uuid.\nconst uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (correlation_id && !uuidRe.test(String(correlation_id))) correlation_id = null;\nif (tenant_id && !uuidRe.test(String(tenant_id))) tenant_id = null;\n\nreturn [{ json: {\n  workflow_name,\n  workflow_id,\n  failed_node,\n  execution_id,\n  error_name,\n  error_message: String(error_message).slice(0, 500),\n  error_stack: String(error_stack).slice(0, 1000),\n  correlation_id,\n  tenant_id,\n  trigger_payload,\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n  telegram_token: $env.TELEGRAM_BOT_TOKEN || '',\n  telegram_chat: $env.TELEGRAM_CHAT_ID || ''\n} }];"
+      },
+      "id": "extract-context",
+      "name": "Extract Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify for replay-safety. poison = non-retryable (bad data / logic / auth) ->\n// parked as manual. transient = retryable (network / 5xx / rate-limit). Default transient\n// (safe: a transient row is replayable; a mislabeled poison just wastes one replay).\nconst c = $('Extract Context').first().json;\nconst hay = ((c.error_message || '') + ' ' + (c.error_name || '')).toLowerCase();\n\nconst poison = ['syntaxerror','typeerror','unexpected token','missing tenant','cannot read prop','is not valid json',' 400',' 401',' 403',' 422','validation','malformed'];\nconst transient = ['etimedout','econnreset','eai_again','enotfound','timeout',' 429',' 500',' 502',' 503',' 504','stripe 5','socket hang up'];\n\nlet error_class = 'transient';\nif (poison.some(s => hay.includes(s))) error_class = 'poison';\nelse if (transient.some(s => hay.includes(s))) error_class = 'transient';\n\nreturn [{ json: Object.assign({}, c, { error_class }) }];"
+      },
+      "id": "classify-error",
+      "name": "Classify Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.supabase_url }}/rest/v1/rpc/bump_dlq",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"p_correlation_id\": {{ JSON.stringify($json.correlation_id) }},\n  \"p_workflow\": {{ JSON.stringify($json.workflow_name) }},\n  \"p_tenant_id\": {{ JSON.stringify($json.tenant_id) }},\n  \"p_error\": {{ JSON.stringify($json.error_message) }},\n  \"p_error_class\": {{ JSON.stringify($json.error_class) }},\n  \"p_payload\": {{ JSON.stringify({ trigger: $json.trigger_payload, error_name: $json.error_name, failed_node: $json.failed_node, execution_id: $json.execution_id, stack: $json.error_stack }) }}\n}",
+        "options": {}
+      },
+      "id": "upsert-dlq",
+      "name": "Upsert DLQ Row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 300],
+      "onError": "continueRegularOutput",
+      "notesInFlow": true,
+      "notes": "Atomic bump_dlq RPC: insert-or-bump-attempts, poison/cap -> manual. continueRegularOutput so a Supabase blip still lets the alert fire."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Non-throwing alert. G1 is the ONE workflow that must never itself error, so the\n// Telegram call is a guarded HTTP call (not the telegram node, which throws on a\n// missing token). Missing token / outage is swallowed and just reported in output.\nconst ctx = $('Classify Error').first().json;\nconst rpc = $('Upsert DLQ Row').first().json;\n\n// bump_dlq returns TABLE -> PostgREST gives an array [{id,attempts,status}]. Empty/{} if the insert node failed.\nconst row = Array.isArray(rpc) ? (rpc[0] || {}) : (rpc || {});\nconst dlq_id = row.id || 'n/a';\nconst attempts = (row.attempts != null) ? row.attempts : '?';\nconst status = row.status || 'unknown';\n\nconst text = [\n  '\\ud83d\\udea8 *FlowOps failure*',\n  'Workflow: ' + (ctx.workflow_name || 'unknown'),\n  'Node: ' + (ctx.failed_node || '\\u2014'),\n  'Class: ' + (ctx.error_class || '?') + ' \\u00b7 attempts: ' + attempts + ' \\u00b7 ' + status,\n  'DLQ: `' + dlq_id + '`',\n  'Correlation: `' + (ctx.correlation_id || '\\u2014') + '`',\n  '',\n  String(ctx.error_message || '').slice(0, 200)\n].join('\\n');\n\nlet alert_delivered = false;\nlet notice = null;\nconst token = ctx.telegram_token;\nconst chat = ctx.telegram_chat;\n\nif (token && chat) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.telegram.org/bot' + token + '/sendMessage',\n      body: { chat_id: chat, text: text, parse_mode: 'Markdown' },\n      json: true\n    });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\n\nreturn [{ json: { dlq_id, attempts, status, error_class: ctx.error_class, correlation_id: ctx.correlation_id, alert_delivered, notice } }];"
+      },
+      "id": "alert-telegram",
+      "name": "Alert Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Fetch Execution", "type": "main", "index": 0 }]]
+    },
+    "Fetch Execution": {
+      "main": [[{ "node": "Extract Context", "type": "main", "index": 0 }]]
+    },
+    "Extract Context": {
+      "main": [[{ "node": "Classify Error", "type": "main", "index": 0 }]]
+    },
+    "Classify Error": {
+      "main": [[{ "node": "Upsert DLQ Row", "type": "main", "index": 0 }]]
+    },
+    "Upsert DLQ Row": {
+      "main": [[{ "node": "Alert Telegram", "type": "main", "index": 0 }]]
+    }
+  }
+}

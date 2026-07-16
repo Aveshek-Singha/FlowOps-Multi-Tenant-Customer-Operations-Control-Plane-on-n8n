@@ -22,16 +22,28 @@ x-n8n-common: &n8n-common
     # set to 'false'. Without it every Code/HTTP node throws "access to env
     # vars denied". Safe in dev/Lead-only; tighten before shared deploys.
     N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+    # Stripe signature verification Code nodes use Node's built-in HMAC.
+    NODE_FUNCTION_ALLOW_BUILTIN: crypto
     # FlowOps app data lives in Supabase (not the local n8n postgres above).
     # Service workflows read these via $env in HTTP/Code nodes (Contract B).
     SUPABASE_URL: ${SUPABASE_URL:-}
     SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:-}
     # Public base URL n8n calls back on (idempotency-check, HITL resume). = ngrok URL.
+    WEBHOOK_URL: ${WEBHOOK_URL:-http://localhost:5678}
     N8N_DOMAIN: ${WEBHOOK_URL:-http://localhost:5678}
     # Telegram approver chat for HITL messages (Contract B onboarding).
     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     # Telegram bot token — G1 global-error handler alerts (Code-node HTTP, non-throwing).
     TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    # Approval reminder/escalation defaults. Escalation chat falls back to TELEGRAM_CHAT_ID.
+    TELEGRAM_ESCALATION_CHAT_ID: ${TELEGRAM_ESCALATION_CHAT_ID:-}
+    FLOWOPS_SECOND_APPROVER: ${FLOWOPS_SECOND_APPROVER:-ops-lead}
+    APPROVAL_REMINDER_AFTER_MINUTES: ${APPROVAL_REMINDER_AFTER_MINUTES:-30}
+    APPROVAL_ESCALATION_AFTER_MINUTES: ${APPROVAL_ESCALATION_AFTER_MINUTES:-120}
+    APPROVAL_REMINDER_REPEAT_MINUTES: ${APPROVAL_REMINDER_REPEAT_MINUTES:-60}
+    # Stripe public webhooks fail closed unless signed with this endpoint secret.
+    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    STRIPE_WEBHOOK_TOLERANCE_SECONDS: ${STRIPE_WEBHOOK_TOLERANCE_SECONDS:-300}
     # GitHub Issues back Service 4 support SLA scanning/escalation.
     GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     GITHUB_REPO: ${GITHUB_REPO:-}
