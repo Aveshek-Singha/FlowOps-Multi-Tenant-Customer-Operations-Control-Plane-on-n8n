@@ -1,0 +1,256 @@
+{
+  "name": "15-approval-reminders",
+  "id": "a10b0000-0000-4000-8000-000000000016",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "approval-reminder-cron",
+      "name": "Approval Reminder Cron",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        240
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        440
+      ],
+      "notesInFlow": true,
+      "notes": "Contract B replay entry. Re-runs the pending approval scan; reminder/escalation audit rows dedupe repeated sends."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/v_pending_approvals",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "select",
+              "value": "audit_id,tenant_id,tenant_name,correlation_id,service,step,payload,created_at"
+            },
+            {
+              "name": "order",
+              "value": "created_at.asc"
+            },
+            {
+              "name": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "fetch-pending",
+      "name": "Fetch Pending Approvals",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/audit_log",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "service",
+              "value": "eq.approvals"
+            },
+            {
+              "name": "created_at",
+              "value": "=gte.{{ new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() }}"
+            },
+            {
+              "name": "select",
+              "value": "step,status,payload,created_at"
+            },
+            {
+              "name": "order",
+              "value": "created_at.desc"
+            },
+            {
+              "name": "limit",
+              "value": "1000"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "fetch-reminder-audit",
+      "name": "Fetch Reminder Audit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const pendingResponse = $('Fetch Pending Approvals').first().json || {};\nconst auditResponse = $('Fetch Reminder Audit').first().json || {};\nconst pendingRows = Array.isArray(pendingResponse.body) ? pendingResponse.body : [];\nconst auditRows = Array.isArray(auditResponse.body) ? auditResponse.body : [];\n\nfunction minutes(value) {\n  if (value == null || value === '') return null;\n  const n = Number(value);\n  return Number.isFinite(n) && n >= 0 ? n : null;\n}\nfunction isoAgeMinutes(createdAt) {\n  const t = Date.parse(createdAt);\n  return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 60000)) : 0;\n}\nfunction redactTelegramError(error, token) {\n  const raw = String(error && error.message ? error.message : error || 'unknown');\n  const scrubbed = token ? raw.split(token).join('[token]') : raw;\n  return scrubbed.length > 200 ? scrubbed.slice(0, 197) + '...' : scrubbed;\n}\nfunction priorFor(auditId) {\n  return auditRows.filter((row) => row && row.payload && row.payload.source_audit_id === auditId);\n}\n\nconst reminderAfter = minutes($env.APPROVAL_REMINDER_AFTER_MINUTES) ?? 30;\nconst escalationAfter = minutes($env.APPROVAL_ESCALATION_AFTER_MINUTES) ?? 120;\nconst repeatAfter = minutes($env.APPROVAL_REMINDER_REPEAT_MINUTES) ?? 60;\nconst token = $env.TELEGRAM_BOT_TOKEN || '';\nconst primaryChat = $env.TELEGRAM_CHAT_ID || '';\nconst escalationChat = $env.TELEGRAM_ESCALATION_CHAT_ID || primaryChat;\nconst fallbackSecondApprover = $env.FLOWOPS_SECOND_APPROVER || 'ops-lead';\nconst audit = [];\n\nasync function sendTelegram(chat, text, buttons) {\n  if (!token || !chat) return { delivered: false, notice: 'telegram skipped: TELEGRAM_BOT_TOKEN/chat not set' };\n  const body = { chat_id: chat, text };\n  if (buttons && buttons.length) body.reply_markup = { inline_keyboard: [buttons] };\n  try {\n    await this.helpers.httpRequest({ method: 'POST', url: 'https://api.telegram.org/bot' + token + '/sendMessage', body, json: true, timeout: 15000 });\n    return { delivered: true, notice: null };\n  } catch (e) {\n    return { delivered: false, notice: 'telegram failed: ' + redactTelegramError(e, token) };\n  }\n}\n\nfor (const row of pendingRows) {\n  if (!row || !row.audit_id) continue;\n  const payload = row.payload || {};\n  const age = isoAgeMinutes(row.created_at);\n  const seen = priorFor(row.audit_id);\n  const lastReminder = seen.find((r) => r.step === 'reminder');\n  const escalated = seen.some((r) => r.step === 'escalate-second-approver' && r.status === 'success');\n  const lastReminderAge = lastReminder ? isoAgeMinutes(lastReminder.created_at) : Infinity;\n  const secondApprover = payload.second_approver || fallbackSecondApprover;\n  let action = null;\n  if (age >= escalationAfter && !escalated) action = 'escalate-second-approver';\n  else if (age >= reminderAfter && (!lastReminder || lastReminderAge >= repeatAfter)) action = 'reminder';\n  if (!action) continue;\n\n  const approveUrl = payload.approve_url || (payload.approval_url ? payload.approval_url + '?decision=approve' : null);\n  const rejectUrl = payload.reject_url || (payload.approval_url ? payload.approval_url + '?decision=reject' : null);\n  const buttons = approveUrl && rejectUrl ? [{ text: 'Approve', url: approveUrl }, { text: 'Reject', url: rejectUrl }] : [];\n  const isEscalation = action === 'escalate-second-approver';\n  const text = [\n    isEscalation ? 'Approval SLA escalation' : 'Approval reminder',\n    'Tenant: ' + (row.tenant_name || payload.tenant_name || row.tenant_id || 'n/a'),\n    'Request: ' + row.service + '/' + row.step,\n    payload.title ? 'Title: ' + payload.title : null,\n    payload.issue_number ? 'Issue: #' + payload.issue_number : null,\n    'Age: ' + age + ' minutes',\n    'Primary approver: ' + (payload.approver || 'n/a'),\n    isEscalation ? 'Second approver: ' + secondApprover : null,\n    'Correlation: ' + row.correlation_id,\n    approveUrl ? 'Approval link attached as buttons.' : 'No approval URL stored on the waiting row; use the original HITL message.'\n  ].filter(Boolean).join('\\n');\n\n  const chat = isEscalation ? escalationChat : primaryChat;\n  const sent = await sendTelegram.call(this, chat, text, buttons);\n  audit.push({ json: {\n    tenant_id: row.tenant_id,\n    correlation_id: row.correlation_id,\n    service: 'approvals',\n    step: action,\n    status: sent.delivered ? 'success' : (sent.notice && sent.notice.startsWith('telegram skipped') ? 'skipped' : 'error'),\n    payload: {\n      source_audit_id: row.audit_id,\n      source_service: row.service,\n      source_step: row.step,\n      tenant_name: row.tenant_name || payload.tenant_name,\n      age_minutes: age,\n      reminder_after_minutes: reminderAfter,\n      escalation_after_minutes: escalationAfter,\n      approver: payload.approver || null,\n      second_approver: secondApprover,\n      telegram_delivered: sent.delivered,\n      telegram_chat: isEscalation && $env.TELEGRAM_ESCALATION_CHAT_ID ? 'escalation' : 'primary',\n      notice: sent.notice\n    }\n  } });\n}\n\nreturn audit;"
+      },
+      "id": "send-reminders",
+      "name": "Send Reminders / Escalations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-reminder-result",
+      "name": "Audit Reminder Result",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        880,
+        240
+      ]
+    }
+  ],
+  "connections": {
+    "Approval Reminder Cron": {
+      "main": [
+        [
+          {
+            "node": "Fetch Pending Approvals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Entry": {
+      "main": [
+        [
+          {
+            "node": "Fetch Pending Approvals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Pending Approvals": {
+      "main": [
+        [
+          {
+            "node": "Fetch Reminder Audit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Reminder Audit": {
+      "main": [
+        [
+          {
+            "node": "Send Reminders / Escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reminders / Escalations": {
+      "main": [
+        [
+          {
+            "node": "Audit Reminder Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
+  ]
+}
