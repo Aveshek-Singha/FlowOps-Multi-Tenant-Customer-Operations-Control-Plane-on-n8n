@@ -1,0 +1,184 @@
+{
+  "name": "16-telegram-approve",
+  "id": "a10b0000-0000-4000-8000-000000000017",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "backbone"
+    }
+  ],
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "execute-workflow-trigger",
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json || {};\nconst payload = input.payload == null\n  ? {}\n  : (typeof input.payload === 'string' ? JSON.parse(input.payload) : input.payload);\nconst tenant_id = input.tenant_id || payload.tenant_id || null;\nconst correlation_id = input.correlation_id || payload.correlation_id || null;\nif (!correlation_id) throw new Error('telegram-approve: missing correlation_id');\nconst service = input.service || payload.service || 'approval';\nconst step = input.step || payload.step || 'approval';\nconst timeout_hours = Number(input.timeout_hours ?? payload.timeout_hours ?? 24);\nconst approver = input.approver || payload.approver || null;\nconst second_approver = input.second_approver || payload.second_approver || null;\nconst text = input.text || payload.text || [\n  'Approval requested',\n  'Service: ' + service + '/' + step,\n  'Correlation: `' + correlation_id + '`'\n].join('\\n');\nreturn [{ json: {\n  tenant_id,\n  correlation_id,\n  service,\n  step,\n  text,\n  parse_mode: input.parse_mode || 'Markdown',\n  chat_id: input.chat_id || $env.TELEGRAM_CHAT_ID || '',\n  timeout_hours: Number.isFinite(timeout_hours) && timeout_hours > 0 ? timeout_hours : 24,\n  approve_label: input.approve_label || 'Approve',\n  reject_label: input.reject_label || 'Reject',\n  approver,\n  second_approver,\n  payload\n} }];"
+      },
+      "id": "normalize-approval-input",
+      "name": "Normalize Approval Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Approval Input').first().json;\nfunction publicResumeUrl(raw) {\n  const publicBase = ($env.WEBHOOK_URL || $env.N8N_DOMAIN || '').replace(/\\/$/, '');\n  if (!publicBase) return raw;\n  try {\n    const source = new URL(raw);\n    const base = new URL(publicBase);\n    return base.origin + source.pathname + source.search + source.hash;\n  } catch (e) {\n    return raw;\n  }\n}\nconst approvalUrl = publicResumeUrl($execution.resumeUrl);\nconst sep = approvalUrl.includes('?') ? '&' : '?';\nconst payload = {\n  ...(p.payload || {}),\n  approver: p.approver,\n  second_approver: p.second_approver,\n  approval_url: approvalUrl,\n  approve_url: approvalUrl + sep + 'decision=approve',\n  reject_url: approvalUrl + sep + 'decision=reject',\n  timeout_hours: p.timeout_hours\n};\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: p.service,\n  step: p.step,\n  status: 'waiting',\n  payload\n} }];"
+      },
+      "id": "prep-audit-waiting",
+      "name": "Prep Audit: Waiting",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-waiting",
+      "name": "Audit: Waiting",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Approval Input').first().json;\nconst waiting = $('Prep Audit: Waiting').first().json;\nconst token = $env.TELEGRAM_BOT_TOKEN || '';\nconst chat = p.chat_id || '';\nif (!token) throw new Error('telegram-approve: TELEGRAM_BOT_TOKEN not set');\nif (!chat) throw new Error('telegram-approve: TELEGRAM_CHAT_ID/chat_id not set');\nconst body = {\n  chat_id: chat,\n  text: p.text,\n  reply_markup: {\n    inline_keyboard: [[\n      { text: p.approve_label, url: waiting.payload.approve_url },\n      { text: p.reject_label, url: waiting.payload.reject_url }\n    ]]\n  }\n};\nif (p.parse_mode) body.parse_mode = p.parse_mode;\ntry {\n  const sent = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.telegram.org/bot' + token + '/sendMessage',\n    body,\n    json: true,\n    timeout: 15000\n  });\n  return [{ json: { ...p, telegram_delivered: true, telegram_message_id: sent && sent.result ? sent.result.message_id : null } }];\n} catch (e) {\n  const raw = String(e && e.message ? e.message : e).split(token).join('[token]');\n  throw new Error('telegram-approve: telegram send failed: ' + raw.slice(0, 500));\n}"
+      },
+      "id": "send-approval-request",
+      "name": "Send Approval Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {
+          "limitWaitTime": true,
+          "limitType": "afterTimeInterval",
+          "resumeAmount": "={{ $json.timeout_hours }}",
+          "resumeUnit": "hours"
+        }
+      },
+      "id": "wait-approval",
+      "name": "Wait For Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        0
+      ],
+      "webhookId": "telegram-approval-resume"
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Send Approval Request').first().json;\nconst query = $json.query || {};\nconst rawDecision = String(query.decision || '').toLowerCase();\nconst decision = rawDecision === 'approve' ? 'approve' : (rawDecision === 'reject' ? 'reject' : 'timeout');\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: p.service,\n  step: p.step,\n  decision,\n  approved: decision === 'approve',\n  rejected: decision === 'reject',\n  timed_out: decision === 'timeout',\n  approver: p.approver,\n  second_approver: p.second_approver,\n  telegram_delivered: p.telegram_delivered,\n  telegram_message_id: p.telegram_message_id\n} }];"
+      },
+      "id": "normalize-decision",
+      "name": "Normalize Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Approval Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Approval Input": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Waiting": {
+      "main": [
+        [
+          {
+            "node": "Audit: Waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit: Waiting": {
+      "main": [
+        [
+          {
+            "node": "Send Approval Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Approval Request": {
+      "main": [
+        [
+          {
+            "node": "Wait For Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait For Approval": {
+      "main": [
+        [
+          {
+            "node": "Normalize Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
