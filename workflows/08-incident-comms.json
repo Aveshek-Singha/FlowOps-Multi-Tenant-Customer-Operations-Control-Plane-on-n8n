@@ -7,8 +7,12 @@
     "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
   },
   "tags": [
-    { "name": "flowops" },
-    { "name": "service" }
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
   ],
   "nodes": [
     {
@@ -22,7 +26,10 @@
       "name": "Uptime Kuma Incident Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [0, 260],
+      "position": [
+        0,
+        260
+      ],
       "webhookId": "uptime-kuma-incident"
     },
     {
@@ -31,31 +38,95 @@
       "name": "Replay Entry",
       "type": "n8n-nodes-base.executeWorkflowTrigger",
       "typeVersion": 1,
-      "position": [0, 520],
+      "position": [
+        0,
+        520
+      ],
       "notesInFlow": true,
       "notes": "Contract B replay entry. Incident events can be tenant-agnostic; 05-dlq-replay allows that workflow explicitly."
     },
     {
       "parameters": {
-        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nfunction statusFrom(raw, msg) {\n  const s = String(raw == null ? '' : raw).toLowerCase();\n  const m = String(msg || '').toLowerCase();\n  if (s === '1' || s === 'up' || s === 'resolved' || m.includes('up') || m.includes('recover')) return 'resolved';\n  if (s === '0' || s === 'down' || s === 'open' || m.includes('down') || m.includes('fail')) return 'open';\n  return 'open';\n}\n\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\nconst monitor = body.monitor || body.heartbeat || body.data || {};\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst monitor_id = String(body.monitor_id || monitor.id || monitor.monitorID || body.id || 'unknown');\nconst monitor_name = body.monitor_name || monitor.name || monitor.hostname || body.name || 'Unknown monitor';\nconst status = body.incident_status || body.status || monitor.status;\nconst incident_status = statusFrom(status, body.msg || body.message || monitor.msg);\nconst sevRaw = String(body.severity || '').toLowerCase();\nconst severity = ['minor', 'major', 'critical'].includes(sevRaw) ? sevRaw : (incident_status === 'open' ? 'major' : 'minor');\nconst region = body.region || monitor.region || (Array.isArray(body.tags) ? (body.tags.find(t => /^region:/i.test(String(t))) || '').split(':')[1] : null) || null;\nconst tenant_id = body.tenant_id || root.tenant_id || null;\nconst event_id = body.event_id || body.heartbeat_id || monitor.heartbeatID || body.id || (monitor_id + ':' + incident_status + ':' + (body.time || body.created_at || 'latest'));\nconst idem_key = 'incident:' + event_id;\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\n\nreturn [{ json: {\n  tenant_id,\n  monitor_id,\n  monitor_name,\n  incident_status,\n  severity,\n  region,\n  message: body.msg || body.message || monitor.msg || null,\n  event_id,\n  idem_key,\n  replay,\n  response_required,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, '')\n} }];"
+        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\n// Explicit status tokens decide first; message sniffing is a last resort with word\n// boundaries, and DOWN patterns are checked BEFORE up ('upstream connect error',\n// 'backup failed' must never classify a real outage as resolved).\nfunction statusFrom(raw, msg) {\n  const s = String(raw == null ? '' : raw).trim().toLowerCase();\n  if (s === '0' || s === 'down' || s === 'open') return 'open';\n  if (s === '1' || s === 'up' || s === 'resolved') return 'resolved';\n  const m = String(msg || '').toLowerCase();\n  if (/\\b(down|fail|failed|failing|failure|offline|timeout|timed out|unreachable|error)\\b/.test(m)) return 'open';\n  if (/\\b(up|online|recovered|recovery|resolved|restored|ok)\\b/.test(m)) return 'resolved';\n  return 'open';\n}\n\n// Uptime Kuma tags arrive as objects ({tag/name, value/color}), not strings.\n// String(t) on an object is '[object Object]', which made the old /^region:/ test\n// always fail -> region null -> the tenant query dropped its region filter and\n// counted ALL active tenants as impacted. Handle both shapes; fail to null.\nfunction regionFrom(tags) {\n  if (!Array.isArray(tags)) return null;\n  for (const t of tags) {\n    if (t != null && typeof t === 'object') {\n      const k = String(t.tag || t.name || t.key || '');\n      const v = t.value != null ? String(t.value) : '';\n      if (/^region$/i.test(k) && v) return v.trim();\n      const packed = /^region:(.+)$/i.exec(v);\n      if (packed) return packed[1].trim();\n    } else {\n      const m = /^region:(.+)$/i.exec(String(t));\n      if (m) return m[1].trim();\n    }\n  }\n  return null;\n}\n\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\n// Uptime Kuma puts status/time/msg on heartbeat and the name on monitor; keep both in reach.\nconst heartbeat = (body.heartbeat && typeof body.heartbeat === 'object') ? body.heartbeat : {};\nconst monitor = (body.monitor && typeof body.monitor === 'object') ? body.monitor : ((body.data && typeof body.data === 'object') ? body.data : heartbeat);\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\n\n// Shared-secret gate for the public webhook path. Replay entries are in-process and\n// trusted. Unset secret = open gate (dev degrade, same spirit as the TELEGRAM_* fallbacks).\nconst secret = $env.FLOWOPS_WEBHOOK_SECRET || '';\nconst reqHeaders = (root.headers && typeof root.headers === 'object') ? root.headers : {};\nconst authorized = !response_required || !secret || String(reqHeaders['x-flowops-secret'] || '') === secret;\n\nconst supabase_url = ($env.SUPABASE_URL || '').replace(/\\/$/, '');\nconst monitor_id = String(body.monitor_id || monitor.id || monitor.monitorID || heartbeat.monitorID || body.id || 'unknown');\nconst monitor_name = body.monitor_name || monitor.name || monitor.hostname || body.name || 'Unknown monitor';\n// ?? not ||: Uptime Kuma sends heartbeat.status = 0 for DOWN, and 0 is falsy.\nconst statusRaw = body.incident_status ?? body.status ?? heartbeat.status ?? monitor.status;\nconst message = body.msg || body.message || heartbeat.msg || monitor.msg || null;\nconst incident_status = statusFrom(statusRaw, message);\nconst sevRaw = String(body.severity || '').toLowerCase();\nconst severity = ['minor', 'major', 'critical'].includes(sevRaw) ? sevRaw : (incident_status === 'open' ? 'major' : 'minor');\nconst region = body.region || monitor.region || regionFrom(body.tags) || regionFrom(monitor.tags) || null;\n\n// tenant_id feeds FK columns (idempotency_keys, audit_log) and a bad value would 4xx\n// AFTER the 202 was already sent, killing the run as poison. Incidents are\n// tenant-agnostic, so anything that is not a UUID of an existing tenant degrades to null.\nconst UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nconst rawTenant = body.tenant_id || root.tenant_id || null;\nlet tenant_id = (typeof rawTenant === 'string' && UUID_RE.test(rawTenant)) ? rawTenant.toLowerCase() : null;\nif (tenant_id && supabase_url) {\n  try {\n    const found = await this.helpers.httpRequest({ method: 'GET', url: supabase_url + '/rest/v1/tenants?id=eq.' + tenant_id + '&select=id&limit=1', headers: { apikey: $env.SUPABASE_SERVICE_KEY, Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY, accept: 'application/json' }, json: true, timeout: 10000 });\n    if (!Array.isArray(found) || found.length === 0) tenant_id = null;\n  } catch (e) {\n    tenant_id = null;\n  }\n}\n\n// Per-event id. body.id is deliberately NOT used as an event id (it is usually the\n// monitor id; a DOWN and its UP would collide and the resolve would be deduped away).\n// The derived fallback keys on status + the event's own timestamp; last resort is a\n// minute bucket - never 'latest' - so a monitor's NEXT outage can never be swallowed\n// as a duplicate of its first one.\nconst event_time = body.time || body.created_at || heartbeat.time || heartbeat.localDateTime || new Date().toISOString().slice(0, 16);\nconst stable_id = body.event_id || body.heartbeat_id || heartbeat.id || monitor.heartbeatID;\nconst event_id = String(stable_id || (monitor_id + ':' + incident_status + ':' + event_time));\nconst idem_key = 'incident:' + event_id;\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\n\nreturn [{ json: {\n  tenant_id,\n  monitor_id,\n  monitor_name,\n  incident_status,\n  severity,\n  region,\n  message,\n  event_id,\n  idem_key,\n  replay,\n  response_required,\n  authorized,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url\n} }];"
       },
       "id": "normalize",
       "name": "Normalize Incident",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [240, 380]
+      "position": [
+        240,
+        380
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-authorized",
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-authorized",
+      "name": "Is Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        420,
+        240
+      ],
+      "notesInFlow": true,
+      "notes": "Webhook calls must send header x-flowops-secret matching FLOWOPS_WEBHOOK_SECRET. Replay entries pass; unset secret = open (dev)."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: 'unauthorized' }) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "respond-unauthorized",
+      "name": "Respond Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        640,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "is-replay",
               "leftValue": "={{ $json.replay }}",
               "rightValue": true,
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -65,19 +136,29 @@
       "name": "Is Replay?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [460, 380]
+      "position": [
+        460,
+        380
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "needs-response",
               "leftValue": "={{ $json.response_required }}",
               "rightValue": true,
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -87,19 +168,27 @@
       "name": "Needs Webhook Response?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [680, 500]
+      "position": [
+        680,
+        500
+      ]
     },
     {
       "parameters": {
         "respondWith": "json",
         "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Incident').item.json.correlation_id }) }}",
-        "options": { "responseCode": 202 }
+        "options": {
+          "responseCode": 202
+        }
       },
       "id": "respond-queued",
       "name": "Respond Queued",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [900, 400]
+      "position": [
+        900,
+        400
+      ]
     },
     {
       "parameters": {
@@ -109,7 +198,10 @@
       "name": "Prep Idempotency Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1120, 500]
+      "position": [
+        1120,
+        500
+      ]
     },
     {
       "parameters": {
@@ -120,19 +212,29 @@
       "name": "Idempotency Check",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [1340, 500]
+      "position": [
+        1340,
+        500
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "is-dup",
               "leftValue": "={{ $json.dup }}",
               "rightValue": true,
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -142,7 +244,10 @@
       "name": "Is Duplicate?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [1560, 500]
+      "position": [
+        1560,
+        500
+      ]
     },
     {
       "parameters": {
@@ -152,7 +257,10 @@
       "name": "Prep Audit: Duplicate",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1780, 320]
+      "position": [
+        1780,
+        320
+      ]
     },
     {
       "parameters": {
@@ -163,7 +271,10 @@
       "name": "Audit: Duplicate",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [2000, 320]
+      "position": [
+        2000,
+        320
+      ]
     },
     {
       "parameters": {
@@ -173,7 +284,10 @@
       "name": "Prep Audit: Started",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1780, 620]
+      "position": [
+        1780,
+        620
+      ]
     },
     {
       "parameters": {
@@ -184,7 +298,10 @@
       "name": "Audit: Started",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [2000, 620]
+      "position": [
+        2000,
+        620
+      ]
     },
     {
       "parameters": {
@@ -193,9 +310,18 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "accept", "value": "application/json" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "accept",
+              "value": "application/json"
+            }
           ]
         },
         "options": {
@@ -210,64 +336,67 @@
       "name": "Fetch Impacted Tenants",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2220, 620],
+      "position": [
+        2220,
+        620
+      ],
       "onError": "continueRegularOutput",
       "notesInFlow": true,
       "notes": "fullResponse keeps a single wrapper item even when the tenant list is [] (an empty array body would otherwise split into zero items and starve the rest of the workflow). Same pattern as 02-idempotency-check."
     },
     {
       "parameters": {
-        "jsCode": "const p = $('Normalize Incident').first().json;\n// Fetch Impacted Tenants runs with fullResponse:true -> single wrapper item {body,statusCode,...}\n// even when PostgREST returns []. body is the tenant array; anything else (HTTP error with\n// onError:continueRegularOutput) degrades to zero impacted tenants.\nconst resp = $('Fetch Impacted Tenants').first().json || {};\nconst tenants = Array.isArray(resp.body) ? resp.body.filter(t => t && t.id) : [];\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, monitor_id: p.monitor_id, monitor_name: p.monitor_name, severity: p.severity, status: p.incident_status === 'resolved' ? 'resolved' : 'open', region: p.region, impact_count: tenants.length, impacted_tenants: tenants.map(t => ({ id: t.id, name: t.name, plan: t.plan, region: t.region })), postmortem: { message: p.message, source: p.replay ? 'replay' : 'uptime-kuma', event_id: p.event_id } } }];"
+        "jsCode": "const p = $('Normalize Incident').first().json;\n// Fetch Impacted Tenants runs with fullResponse:true -> single wrapper item {body,statusCode,...}\n// even when PostgREST returns []. A non-array body means the lookup itself FAILED\n// (onError:continueRegularOutput) -> impact is UNKNOWN, not zero; flag it instead of\n// publishing a fabricated 0 in the incident row and the Telegram comms.\nconst resp = $('Fetch Impacted Tenants').first().json || {};\nconst ok = Array.isArray(resp.body);\nconst tenants = ok ? resp.body.filter(t => t && t.id) : [];\n// Aggregates only: incidents is anon-readable (status-page style), so per-tenant\n// name/plan/region (PII) must NOT be embedded in the row. Counts by plan/region\n// preserve impact analytics without leaking tenant identity.\nconst countBy = (arr, key) => {\n  const m = {};\n  for (const t of arr) { const v = (t && t[key] != null) ? String(t[key]) : 'unknown'; m[v] = (m[v] || 0) + 1; }\n  return m;\n};\nconst byPlan = countBy(tenants, 'plan');\nconst byRegion = countBy(tenants, 'region');\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, monitor_id: p.monitor_id, monitor_name: p.monitor_name, severity: p.severity, status: p.incident_status === 'resolved' ? 'resolved' : 'open', region: p.region, impact_count: tenants.length, impact_unknown: !ok, impact_by_plan: byPlan, impact_by_region: byRegion, postmortem: { message: p.message, source: p.replay ? 'replay' : 'uptime-kuma', event_id: p.event_id, impact_unknown: !ok, impact_by_plan: byPlan, impact_by_region: byRegion } } }];"
       },
       "id": "prep-incident-row",
       "name": "Prep Incident Row",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2440, 620]
+      "position": [
+        2440,
+        620
+      ]
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "={{ $('Normalize Incident').item.json.supabase_url }}/rest/v1/incidents",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Content-Type", "value": "application/json" },
-            { "name": "Prefer", "value": "return=representation" }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={\n  \"correlation_id\": {{ JSON.stringify($json.correlation_id) }},\n  \"monitor_id\": {{ JSON.stringify($json.monitor_id) }},\n  \"monitor_name\": {{ JSON.stringify($json.monitor_name) }},\n  \"severity\": {{ JSON.stringify($json.severity) }},\n  \"status\": {{ JSON.stringify($json.status) }},\n  \"region\": {{ JSON.stringify($json.region) }},\n  \"impact_count\": {{ JSON.stringify($json.impact_count) }},\n  \"postmortem\": {{ JSON.stringify(Object.assign({}, $json.postmortem, { impacted_tenants: $json.impacted_tenants })) }}\n}",
-        "options": {}
+        "jsCode": "// Was a blind POST. Now:\n//  - a resolved event CLOSES the matching open/monitoring row(s) for this monitor\n//    (PATCH) instead of inserting a second row and leaving the first open forever;\n//    if nothing was open, a resolved row is still inserted for the record;\n//  - a replay checks correlation_id first, so re-running an execution that already\n//    wrote its incident does not duplicate the row (replay bypasses the idempotency\n//    gate by design and incidents has no natural unique key).\n// Errors here throw -> G1 error handler -> DLQ, same as the old HTTP node.\nconst p = $('Normalize Incident').first().json;\nconst row = $input.first().json;\nconst base = p.supabase_url + '/rest/v1/incidents';\nconst H = { apikey: $env.SUPABASE_SERVICE_KEY, Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY, 'Content-Type': 'application/json', Prefer: 'return=representation' };\nconst req = (opts) => this.helpers.httpRequest(Object.assign({ json: true, timeout: 15000, headers: H }, opts));\n\nlet action = null;\nlet incident = null;\n\nif (row.status === 'resolved') {\n  const closed = await req({ method: 'PATCH', url: base + '?monitor_id=eq.' + encodeURIComponent(row.monitor_id) + '&status=in.(open,monitoring)', body: { status: 'resolved' } });\n  if (Array.isArray(closed) && closed.length > 0) { action = 'closed'; incident = closed[0]; }\n}\n\nif (!incident && p.replay) {\n  const existing = await req({ method: 'GET', url: base + '?correlation_id=eq.' + encodeURIComponent(row.correlation_id) + '&select=id,status&limit=1' });\n  if (Array.isArray(existing) && existing.length > 0) { action = 'replay-already-written'; incident = existing[0]; }\n}\n\nif (!incident) {\n  const inserted = await req({ method: 'POST', url: base, body: {\n    correlation_id: row.correlation_id,\n    monitor_id: row.monitor_id,\n    monitor_name: row.monitor_name,\n    severity: row.severity,\n    status: row.status,\n    region: row.region,\n    impact_count: row.impact_count,\n    postmortem: row.postmortem\n  } });\n  incident = Array.isArray(inserted) ? inserted[0] : inserted;\n  action = 'inserted';\n}\n\nreturn [{ json: { action, incident_id: incident && incident.id ? incident.id : null, status: row.status, correlation_id: row.correlation_id } }];"
       },
       "id": "insert-incident",
-      "name": "Insert Incident",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [2660, 620]
+      "name": "Upsert Incident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        620
+      ],
+      "notesInFlow": true,
+      "notes": "Resolve events close the open incident row; replays dedupe on correlation_id; only genuinely new incidents insert."
     },
     {
       "parameters": {
-        "jsCode": "const p = $('Normalize Incident').first().json;\nconst row = $('Prep Incident Row').first().json;\nconst text = [\n  p.incident_status === 'resolved' ? 'Incident resolved' : 'Incident opened',\n  'Monitor: ' + p.monitor_name + ' (' + p.monitor_id + ')',\n  'Severity: ' + p.severity + (p.region ? ' | Region: ' + p.region : ''),\n  'Impacted active tenants: ' + row.impact_count,\n  'Correlation: `' + p.correlation_id + '`'\n].join('\\n');\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\nif (token && chat) {\n  try {\n    await this.helpers.httpRequest({ method: 'POST', url: 'https://api.telegram.org/bot' + token + '/sendMessage', body: { chat_id: chat, text, parse_mode: 'Markdown' }, json: true });\n    alert_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, alert_delivered, notice, impact_count: row.impact_count } }];"
+        "jsCode": "const p = $('Normalize Incident').first().json;\nconst row = $('Prep Incident Row').first().json;\nconst text = [\n  p.incident_status === 'resolved' ? 'Incident resolved' : 'Incident opened',\n  'Monitor: ' + p.monitor_name + ' (' + p.monitor_id + ')',\n  'Severity: ' + p.severity + (p.region ? ' | Region: ' + p.region : ''),\n  'Impacted active tenants: ' + (row.impact_unknown ? 'unknown (tenant lookup failed)' : row.impact_count),\n  'Correlation: ' + p.correlation_id\n].join('\\n');\nlet alert_delivered = false;\nlet notice = null;\nconst token = $env.TELEGRAM_BOT_TOKEN;\nconst chat = $env.TELEGRAM_CHAT_ID;\nif (token && chat) {\n  try {\n    // Plain text on purpose: parse_mode:'Markdown' makes Telegram 400 on unbalanced\n    // '_' / '*' in monitor names, silently killing the alert this service exists to send.\n    await this.helpers.httpRequest({ method: 'POST', url: 'https://api.telegram.org/bot' + token + '/sendMessage', body: { chat_id: chat, text }, json: true, timeout: 15000 });\n    alert_delivered = true;\n  } catch (e) {\n    // Never persist the raw error: n8n error messages can embed the request URL,\n    // which contains the bot token. audit_log is anon-readable in dev.\n    notice = 'telegram failed: ' + String(e && e.message ? e.message : e).split(token).join('[token]');\n  }\n} else {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n}\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, alert_delivered, notice, impact_count: row.impact_count, impact_unknown: !!row.impact_unknown } }];"
       },
       "id": "notify-telegram",
       "name": "Notify Telegram",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2880, 620]
+      "position": [
+        2880,
+        620
+      ]
     },
     {
       "parameters": {
-        "jsCode": "const p = $('Normalize Incident').first().json;\nconst n = $('Notify Telegram').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'incident', step: 'segment-tenants', status: 'success', payload: { monitor_id: p.monitor_id, status: p.incident_status, region: p.region, impact_count: n.impact_count, telegram_delivered: n.alert_delivered, notice: n.notice } } }];"
+        "jsCode": "const p = $('Normalize Incident').first().json;\nconst n = $('Notify Telegram').first().json;\nconst u = $('Upsert Incident').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id, service: 'incident', step: 'segment-tenants', status: 'success', payload: { monitor_id: p.monitor_id, status: p.incident_status, region: p.region, impact_count: n.impact_count, impact_unknown: n.impact_unknown, incident_action: u.action, incident_id: u.incident_id, telegram_delivered: n.alert_delivered, notice: n.notice } } }];"
       },
       "id": "prep-audit-success",
       "name": "Prep Audit: Success",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3100, 620]
+      "position": [
+        3100,
+        620
+      ]
     },
     {
       "parameters": {
@@ -278,69 +407,238 @@
       "name": "Audit: Success",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [3320, 620]
+      "position": [
+        3320,
+        620
+      ]
     }
   ],
   "connections": {
     "Uptime Kuma Incident Webhook": {
-      "main": [[{ "node": "Normalize Incident", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalize Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Replay Entry": {
-      "main": [[{ "node": "Normalize Incident", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalize Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Normalize Incident": {
-      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Is Authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Is Replay?": {
       "main": [
-        [{ "node": "Prep Audit: Started", "type": "main", "index": 0 }],
-        [{ "node": "Needs Webhook Response?", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs Webhook Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Needs Webhook Response?": {
       "main": [
-        [{ "node": "Respond Queued", "type": "main", "index": 0 }],
-        [{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Respond Queued",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Respond Queued": {
-      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Idempotency Input": {
-      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Idempotency Check": {
-      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Is Duplicate?": {
       "main": [
-        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
-        [{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Prep Audit: Duplicate": {
-      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Started": {
-      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Audit: Started": {
-      "main": [[{ "node": "Fetch Impacted Tenants", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fetch Impacted Tenants",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Fetch Impacted Tenants": {
-      "main": [[{ "node": "Prep Incident Row", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Incident Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Incident Row": {
-      "main": [[{ "node": "Insert Incident", "type": "main", "index": 0 }]]
-    },
-    "Insert Incident": {
-      "main": [[{ "node": "Notify Telegram", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Upsert Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Notify Telegram": {
-      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Success": {
-      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Incident": {
+      "main": [
+        [
+          {
+            "node": "Notify Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   }
 }

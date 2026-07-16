@@ -1,0 +1,686 @@
+{
+  "name": "14-identity-lifecycle",
+  "id": "a10b0000-0000-4000-8000-000000000015",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "identity-lifecycle",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "identity-webhook",
+      "name": "Identity Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        260
+      ],
+      "webhookId": "identity-lifecycle"
+    },
+    {
+      "parameters": {},
+      "id": "replay-entry",
+      "name": "Replay Entry",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function uuidv4() {\n  if (globalThis.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nfunction asArray(value) {\n  if (Array.isArray(value)) return value;\n  if (value == null) return [];\n  return [value];\n}\n\nfunction normalizeEmail(value) {\n  return String(value || '').trim().toLowerCase();\n}\n\nfunction statusFrom(value, fallback) {\n  const status = String(value || fallback || 'active').toLowerCase();\n  if (['active', 'pending', 'revoked'].includes(status)) return status;\n  if (['disabled', 'deactivated', 'inactive', 'deleted'].includes(status)) return 'revoked';\n  // Unknown status = least-privileged state, never a silent activation.\n  return 'pending';\n}\n\nconst root = $input.first().json || {};\nlet body = root.body || root;\n// Replay payloads may carry the full webhook envelope ({headers,query,body}); unwrap it.\nif (body && typeof body === 'object' && body.body && typeof body.body === 'object' && (body.headers || body.query || body.webhookUrl)) body = body.body;\nconst replay = !!root.replay;\nconst response_required = !!root.body && !replay;\nconst tenant_id = body.tenant_id || root.tenant_id || null;\nconst action = String(body.action || body.type || 'upsert').toLowerCase();\nconst validActions = ['upsert', 'revoke', 'sync', 'reconcile'];\n\nconst users = [];\nfor (const user of asArray(body.users)) {\n  const email = normalizeEmail(user.email || user.user_email || user.userName || user.username);\n  if (!email) continue;\n  users.push({\n    email,\n    status: statusFrom(user.status, user.active === false ? 'revoked' : 'active'),\n    last_seen: user.last_seen || user.lastSeen || null,\n    source_id: user.id || user.externalId || null\n  });\n}\n\nfor (const resource of asArray(body.Resources || body.resources)) {\n  const email = normalizeEmail(\n    resource.userName ||\n    resource.username ||\n    resource.email ||\n    (Array.isArray(resource.emails) && resource.emails[0] && resource.emails[0].value)\n  );\n  if (!email) continue;\n  users.push({\n    email,\n    status: statusFrom(resource.status, resource.active === false ? 'revoked' : 'active'),\n    last_seen: resource.last_seen || resource.lastSeen || null,\n    source_id: resource.id || resource.externalId || null\n  });\n}\n\nconst singleEmail = normalizeEmail(body.email || body.user_email || body.userName);\nif (singleEmail) {\n  users.push({\n    email: singleEmail,\n    status: action === 'revoke' ? 'revoked' : statusFrom(body.status, body.active === false ? 'revoked' : 'active'),\n    last_seen: body.last_seen || body.lastSeen || null,\n    source_id: body.user_id || body.id || null\n  });\n}\n\nconst seen = new Set();\nconst normalizedUsers = [];\nfor (const user of users) {\n  if (seen.has(user.email)) continue;\n  seen.add(user.email);\n  normalizedUsers.push(user);\n}\n\nconst userKey = normalizedUsers.map((user) => user.email + ':' + user.status).sort().join('|') || 'empty';\n// body.id/scim_id are RESOURCE ids — stable across a user's whole lifecycle. Used alone\n// they would dedupe a later revocation against the original provision. Derived keys carry\n// the roster+status hash AND a day bucket so recurring syncs re-run daily; only an explicit\n// event_id keeps exact-once semantics.\nconst dayBucket = new Date().toISOString().slice(0, 10);\nconst sourceId = body.scim_id || (body.id && !body.event_id ? body.id : null);\nconst event_id = body.event_id || ((sourceId ? sourceId + ':' : '') + tenant_id + ':' + action + ':' + userKey + ':' + dayBucket);\nconst correlation_id = replay && root.correlation_id ? root.correlation_id : uuidv4();\nconst revoke_missing = body.revoke_missing != null ? !!body.revoke_missing : action === 'reconcile';\nconst stale_days = body.stale_days != null ? Number(body.stale_days) : null;\n// An empty desired roster with revoke_missing would revoke EVERY seat in the tenant.\n// Refuse unless the caller explicitly confirms that intent.\nconst empty_roster_revoke = revoke_missing && normalizedUsers.length === 0 && !body.confirm_empty_roster;\nconst invalid = !tenant_id || !validActions.includes(action) || ((action === 'upsert' || action === 'revoke' || action === 'sync') && normalizedUsers.length === 0) || empty_roster_revoke;\n\nreturn [{ json: {\n  tenant_id,\n  action,\n  users: normalizedUsers,\n  event_id,\n  idem_key: 'identity:' + event_id,\n  replay,\n  response_required,\n  revoke_missing,\n  stale_days: Number.isFinite(stale_days) && stale_days > 0 ? stale_days : null,\n  invalid,\n  invalid_reason: invalid ? (empty_roster_revoke ? 'refused: revoke_missing with an empty desired roster would revoke every seat in the tenant; pass confirm_empty_roster:true to proceed' : 'tenant_id, action=upsert|revoke|sync|reconcile, and at least one user for upsert/revoke/sync are required') : null,\n  correlation_id,\n  execution_id: String($execution.id),\n  supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, '')\n} }];"
+      },
+      "id": "normalize-identity-event",
+      "name": "Normalize Identity Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-replay",
+              "leftValue": "={{ $json.replay }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-replay",
+      "name": "Is Replay?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        460,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "needs-response",
+              "leftValue": "={{ $json.response_required }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "needs-webhook-response",
+      "name": "Needs Webhook Response?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        680,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued', correlation_id: $('Normalize Identity Event').item.json.correlation_id }) }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "respond-queued",
+      "name": "Respond Queued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-invalid",
+              "leftValue": "={{ $json.invalid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "invalid-request",
+      "name": "Invalid Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Identity Event').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id || null,\n  correlation_id: p.correlation_id,\n  service: 'identity',\n  step: 'ingest',\n  status: 'error',\n  payload: { reason: p.invalid_reason, action: p.action, event_id: p.event_id, user_count: (p.users || []).length }\n} }];"
+      },
+      "id": "prep-audit-invalid",
+      "name": "Prep Audit: Invalid",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-invalid",
+      "name": "Audit: Invalid",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        340
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Identity Event').first().json;\nreturn [{ json: { key: p.idem_key, tenant_id: p.tenant_id, workflow: '14-identity-lifecycle' } }];"
+      },
+      "id": "prep-idempotency-input",
+      "name": "Prep Idempotency Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1340,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000004",
+        "options": {}
+      },
+      "id": "idempotency-check",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-dup",
+              "leftValue": "={{ $json.dup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Identity Event').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'identity',\n  step: 'ingest',\n  status: 'skipped',\n  payload: { reason: 'duplicate event', key: p.idem_key, action: p.action, event_id: p.event_id }\n} }];"
+      },
+      "id": "prep-audit-duplicate",
+      "name": "Prep Audit: Duplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-duplicate",
+      "name": "Audit: Duplicate",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Identity Event').first().json;\nreturn [{ json: { tenant_id: p.tenant_id, correlation_id: p.correlation_id } }];"
+      },
+      "id": "prep-resolve-input",
+      "name": "Prep Resolve Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000001",
+        "options": {}
+      },
+      "id": "resolve-policy",
+      "name": "Resolve Policy",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2220,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Identity Event').first().json;\nconst resolved = $('Resolve Policy').first().json || {};\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'identity',\n  step: 'sync',\n  status: 'started',\n  payload: {\n    action: p.action,\n    source: p.replay ? 'replay' : 'webhook',\n    event_id: p.event_id,\n    execution_id: p.execution_id,\n    tenant_name: resolved.tenant_name || null,\n    desired_user_count: (p.users || []).length,\n    revoke_missing: p.revoke_missing,\n    stale_days: p.stale_days\n  }\n} }];"
+      },
+      "id": "prep-audit-started",
+      "name": "Prep Audit: Started",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2440,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-started",
+      "name": "Audit: Started",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2660,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Normalize Identity Event').first().json;\nconst resolved = $('Resolve Policy').first().json || {};\nconst H = {\n  apikey: $env.SUPABASE_SERVICE_KEY,\n  Authorization: 'Bearer ' + $env.SUPABASE_SERVICE_KEY,\n  accept: 'application/json',\n  'content-type': 'application/json'\n};\nconst preferUpsert = Object.assign({}, H, { Prefer: 'resolution=merge-duplicates,return=representation' });\nconst preferPatch = Object.assign({}, H, { Prefer: 'return=representation' });\nconst helpers = this.helpers;\n\nfunction enc(value) {\n  return encodeURIComponent(String(value));\n}\nasync function get(path) {\n  return await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: H, json: true });\n}\n// Paginated fetch: PostgREST caps responses (max-rows); missing a page here would\n// mean seats silently escaping revocation.\nasync function getAll(path, pageSize = 1000) {\n  const out = [];\n  for (let from = 0; ; from += pageSize) {\n    const page = await helpers.httpRequest({ method: 'GET', url: p.supabase_url + path, headers: Object.assign({}, H, { Range: from + '-' + (from + pageSize - 1), 'Range-Unit': 'items' }), json: true });\n    if (!Array.isArray(page) || page.length === 0) break;\n    out.push(...page);\n    if (page.length < pageSize) break;\n  }\n  return out;\n}\nasync function post(path, body) {\n  return await helpers.httpRequest({ method: 'POST', url: p.supabase_url + path, headers: preferUpsert, body, json: true });\n}\nasync function patch(path, body) {\n  return await helpers.httpRequest({ method: 'PATCH', url: p.supabase_url + path, headers: preferPatch, body, json: true });\n}\n\nconst tenantRows = await get('/rest/v1/tenants?id=eq.' + enc(p.tenant_id) + '&select=id,name,plan,region,status,health_score');\nif (!tenantRows || tenantRows.length === 0) {\n  throw new Error('identity: tenant not found: ' + p.tenant_id);\n}\nconst tenant = tenantRows[0];\nconst beforeRows = await getAll('/rest/v1/seats?tenant_id=eq.' + enc(p.tenant_id) + '&select=id,user_email,status,last_seen,created_at');\nconst beforeByEmail = new Map((beforeRows || []).map((seat) => [String(seat.user_email || '').toLowerCase(), seat]));\nconst desiredEmails = new Set(p.users.map((user) => user.email));\n\nlet upserted = [];\nif (p.users.length > 0) {\n  // last_seen is activity telemetry — a sync asserting existence must not stamp it,\n  // or stale-seat detection can never fire. Split batches so each bulk upsert has\n  // uniform keys (PostgREST requirement).\n  const toRow = (user, withSeen) => {\n    const row = { tenant_id: p.tenant_id, user_email: user.email, status: p.action === 'revoke' ? 'revoked' : user.status };\n    if (withSeen) row.last_seen = user.last_seen;\n    return row;\n  };\n  const withSeen = p.users.filter((user) => user.last_seen);\n  const withoutSeen = p.users.filter((user) => !user.last_seen);\n  if (withSeen.length > 0) upserted = upserted.concat(await post('/rest/v1/seats?on_conflict=tenant_id,user_email', withSeen.map((user) => toRow(user, true))));\n  if (withoutSeen.length > 0) upserted = upserted.concat(await post('/rest/v1/seats?on_conflict=tenant_id,user_email', withoutSeen.map((user) => toRow(user, false))));\n}\n\nlet revokedMissing = [];\nif ((p.action === 'sync' || p.action === 'reconcile') && p.revoke_missing) {\n  const missing = (beforeRows || [])\n    .filter((seat) => ['active', 'pending'].includes(seat.status))\n    .filter((seat) => !desiredEmails.has(String(seat.user_email || '').toLowerCase()));\n  const missingIds = missing.map((seat) => seat.id);\n  for (let i = 0; i < missingIds.length; i += 100) {\n    const changed = await patch('/rest/v1/seats?id=in.(' + missingIds.slice(i, i + 100).map(enc).join(',') + ')', { status: 'revoked' });\n    revokedMissing.push(...(Array.isArray(changed) ? changed : [changed]));\n  }\n}\n\nlet revokedStale = [];\nif (p.action === 'reconcile' && p.stale_days) {\n  const cutoff = Date.now() - p.stale_days * 24 * 60 * 60 * 1000;\n  const stale = (beforeRows || [])\n    .filter((seat) => ['active', 'pending'].includes(seat.status))\n    .filter((seat) => seat.last_seen && new Date(seat.last_seen).getTime() < cutoff)\n    .filter((seat) => !revokedMissing.some((revoked) => revoked && revoked.id === seat.id));\n  const staleIds = stale.map((seat) => seat.id);\n  for (let i = 0; i < staleIds.length; i += 100) {\n    const changed = await patch('/rest/v1/seats?id=in.(' + staleIds.slice(i, i + 100).map(enc).join(',') + ')', { status: 'revoked' });\n    revokedStale.push(...(Array.isArray(changed) ? changed : [changed]));\n  }\n}\n\nconst afterRows = await getAll('/rest/v1/seats?tenant_id=eq.' + enc(p.tenant_id) + '&select=id,user_email,status,last_seen,created_at&order=user_email.asc');\nconst summary = {\n  tenant_id: p.tenant_id,\n  tenant_name: tenant.name,\n  action: p.action,\n  desired_user_count: p.users.length,\n  before_count: (beforeRows || []).length,\n  after_count: (afterRows || []).length,\n  active_count: (afterRows || []).filter((seat) => seat.status === 'active').length,\n  pending_count: (afterRows || []).filter((seat) => seat.status === 'pending').length,\n  revoked_count: (afterRows || []).filter((seat) => seat.status === 'revoked').length,\n  upserted_count: Array.isArray(upserted) ? upserted.length : 0,\n  revoked_missing_count: revokedMissing.length,\n  revoked_stale_count: revokedStale.length,\n  entitlements: (resolved.policy && resolved.policy.entitlements) || {},\n  completed_at: new Date().toISOString()\n};\n\nlet telegram_delivered = false;\nlet notice = null;\nconst tgToken = $env.TELEGRAM_BOT_TOKEN || '';\nconst tgChat = $env.TELEGRAM_CHAT_ID || '';\nif (tgToken && tgChat && (summary.revoked_missing_count > 0 || summary.revoked_stale_count > 0)) {\n  const text = [\n    'FlowOps identity lifecycle',\n    'Tenant: ' + tenant.name,\n    'Action: ' + p.action,\n    'Upserted: ' + summary.upserted_count,\n    'Revoked missing: ' + summary.revoked_missing_count,\n    'Revoked stale: ' + summary.revoked_stale_count,\n    'Correlation: ' + p.correlation_id\n  ].join('\\n');\n  try {\n    await helpers.httpRequest({\n      method: 'POST',\n      url: 'https://api.telegram.org/bot' + tgToken + '/sendMessage',\n      body: { chat_id: tgChat, text },\n      json: true\n    });\n    telegram_delivered = true;\n  } catch (e) {\n    notice = 'telegram failed: ' + (e && e.message ? e.message : String(e));\n  }\n} else if (!tgToken || !tgChat) {\n  notice = 'telegram skipped: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set';\n} else {\n  notice = 'telegram skipped: no revocations';\n}\n\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  event_id: p.event_id,\n  summary,\n  changed_users: {\n    upserted: Array.isArray(upserted) ? upserted.map((seat) => ({ email: seat.user_email, status: seat.status })) : [],\n    revoked_missing: revokedMissing.map((seat) => ({ email: seat.user_email, status: seat.status })),\n    revoked_stale: revokedStale.map((seat) => ({ email: seat.user_email, status: seat.status }))\n  },\n  telegram_delivered,\n  notice\n} }];"
+      },
+      "id": "reconcile-seats",
+      "name": "Reconcile Seats",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $('Reconcile Seats').first().json;\nreturn [{ json: {\n  tenant_id: r.tenant_id,\n  correlation_id: r.correlation_id,\n  service: 'identity',\n  step: 'reconcile-seats',\n  status: 'success',\n  payload: {\n    event_id: r.event_id,\n    summary: r.summary,\n    changed_users: r.changed_users,\n    telegram_delivered: r.telegram_delivered,\n    notice: r.notice\n  }\n} }];"
+      },
+      "id": "prep-audit-success",
+      "name": "Prep Audit: Success",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3100,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-success",
+      "name": "Audit: Success",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        3320,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: \"error\", correlation_id: $(\"Normalize Identity Event\").item.json.correlation_id, message: $(\"Normalize Identity Event\").item.json.invalid_reason }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "respond-invalid",
+      "name": "Respond Invalid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-invalid-pre",
+              "leftValue": "={{ $(\"Normalize Identity Event\").item.json.invalid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "invalid-before-respond",
+      "name": "Invalid Before Respond?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        790,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Identity Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Identity Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Entry": {
+      "main": [
+        [
+          {
+            "node": "Normalize Identity Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Identity Event": {
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Replay?": {
+      "main": [
+        [
+          {
+            "node": "Invalid Request?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs Webhook Response?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Webhook Response?": {
+      "main": [
+        [
+          {
+            "node": "Invalid Before Respond?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Invalid Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Queued": {
+      "main": [
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invalid Request?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Invalid": {
+      "main": [
+        [
+          {
+            "node": "Audit: Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Idempotency Input": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Resolve Input": {
+      "main": [
+        [
+          {
+            "node": "Resolve Policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Policy": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit: Started": {
+      "main": [
+        [
+          {
+            "node": "Reconcile Seats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconcile Seats": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Success": {
+      "main": [
+        [
+          {
+            "node": "Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Invalid Before Respond?": {
+      "main": [
+        [
+          {
+            "node": "Respond Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Invalid": {
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
+  },
+  "tags": [
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
+  ]
+}
