@@ -21,12 +21,12 @@ insert into tenants (id, name, plan, region, status, health_score, created_at) v
 
 -- ── tenant_policies (JSONB drives retry/approval/entitlement per tenant) ─────
 insert into tenant_policies (tenant_id, policy) values
- ('11111111-1111-1111-1111-111111111111','{"retry":{"max_attempts":5,"backoff":"exponential"},"approval":{"required_over_usd":10000,"approver":"csm-lead"},"entitlements":{"sso":true,"api":true}}'),
- ('22222222-2222-2222-2222-222222222222','{"retry":{"max_attempts":3,"backoff":"linear"},"approval":{"required_over_usd":5000,"approver":"csm"},"entitlements":{"sso":true,"api":false}}'),
- ('33333333-3333-3333-3333-333333333333','{"retry":{"max_attempts":3,"backoff":"linear"},"approval":{"required_over_usd":5000,"approver":"csm"},"entitlements":{"sso":false,"api":false}}'),
- ('44444444-4444-4444-4444-444444444444','{"retry":{"max_attempts":5,"backoff":"exponential"},"approval":{"required_over_usd":10000,"approver":"csm-lead"},"entitlements":{"sso":true,"api":true}}'),
- ('55555555-5555-5555-5555-555555555555','{"retry":{"max_attempts":1,"backoff":"none"},"approval":{"required_over_usd":1000,"approver":"csm"},"entitlements":{"sso":false,"api":false}}'),
- ('66666666-6666-6666-6666-666666666666','{"retry":{"max_attempts":3,"backoff":"linear"},"approval":{"required_over_usd":10000,"approver":"csm-lead"},"entitlements":{"sso":true,"api":true}}');
+ ('11111111-1111-1111-1111-111111111111','{"retry":{"max_attempts":5,"backoff":"exponential"},"approval":{"required_over_usd":10000,"approver":"csm-lead","second_approver":"ops-lead"},"entitlements":{"sso":true,"api":true}}'),
+ ('22222222-2222-2222-2222-222222222222','{"retry":{"max_attempts":3,"backoff":"linear"},"approval":{"required_over_usd":5000,"approver":"csm","second_approver":"csm-lead"},"entitlements":{"sso":true,"api":false}}'),
+ ('33333333-3333-3333-3333-333333333333','{"retry":{"max_attempts":3,"backoff":"linear"},"approval":{"required_over_usd":5000,"approver":"csm","second_approver":"csm-lead"},"entitlements":{"sso":false,"api":false}}'),
+ ('44444444-4444-4444-4444-444444444444','{"retry":{"max_attempts":5,"backoff":"exponential"},"approval":{"required_over_usd":10000,"approver":"csm-lead","second_approver":"ops-lead"},"entitlements":{"sso":true,"api":true}}'),
+ ('55555555-5555-5555-5555-555555555555','{"retry":{"max_attempts":1,"backoff":"none"},"approval":{"required_over_usd":1000,"approver":"csm","second_approver":"csm-lead"},"entitlements":{"sso":false,"api":false}}'),
+ ('66666666-6666-6666-6666-666666666666','{"retry":{"max_attempts":3,"backoff":"linear"},"approval":{"required_over_usd":10000,"approver":"csm-lead","second_approver":"ops-lead"},"entitlements":{"sso":true,"api":true}}');
 
 -- ── audit_log — correlation-ID traces. Two 'waiting' rows feed pending approvals.
 insert into audit_log (tenant_id, correlation_id, service, step, status, payload, created_at) values
@@ -38,10 +38,10 @@ insert into audit_log (tenant_id, correlation_id, service, step, status, payload
  -- Globex dunning trace with a HITL approval currently WAITING
  ('22222222-2222-2222-2222-222222222222','bbbbbbbb-0000-0000-0000-000000000002','dunning','ingest',            'started','{"invoice":"in_globex_01"}', now() - interval '40 minutes'),
  ('22222222-2222-2222-2222-222222222222','bbbbbbbb-0000-0000-0000-000000000002','dunning','resolve-policy',    'success','{"max_attempts":3}',        now() - interval '39 minutes'),
- ('22222222-2222-2222-2222-222222222222','bbbbbbbb-0000-0000-0000-000000000002','dunning','approve-writeoff',  'waiting','{"amount_usd":6200}',        now() - interval '38 minutes'),
+ ('22222222-2222-2222-2222-222222222222','bbbbbbbb-0000-0000-0000-000000000002','dunning','approve-writeoff',  'waiting','{"amount_usd":6200,"approver":"csm","second_approver":"csm-lead"}',        now() - interval '38 minutes'),
  -- Initech SLA escalation with a HITL approval currently WAITING
  ('33333333-3333-3333-3333-333333333333','cccccccc-0000-0000-0000-000000000003','sla','scan-breach',          'success','{"issue":42,"age_h":52}',    now() - interval '20 minutes'),
- ('33333333-3333-3333-3333-333333333333','cccccccc-0000-0000-0000-000000000003','sla','approve-escalation',   'waiting','{"priority":"P1"}',          now() - interval '18 minutes'),
+ ('33333333-3333-3333-3333-333333333333','cccccccc-0000-0000-0000-000000000003','sla','approve-escalation',   'waiting','{"priority":"P1","approver":"csm","second_approver":"csm-lead"}',          now() - interval '18 minutes'),
  -- Initech incident trace that errored (this one lands in DLQ below)
  ('33333333-3333-3333-3333-333333333333','dddddddd-0000-0000-0000-000000000004','incident','segment-tenants', 'error','{"reason":"api timeout"}',    now() - interval '10 minutes');
 
