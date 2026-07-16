@@ -6,8 +6,12 @@
     "executionOrder": "v1"
   },
   "tags": [
-    { "name": "flowops" },
-    { "name": "backbone" }
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "backbone"
+    }
   ],
   "nodes": [
     {
@@ -16,7 +20,10 @@
       "name": "Execute Workflow Trigger",
       "type": "n8n-nodes-base.executeWorkflowTrigger",
       "typeVersion": 1,
-      "position": [0, 0]
+      "position": [
+        0,
+        0
+      ]
     },
     {
       "parameters": {
@@ -26,7 +33,10 @@
       "name": "Normalize Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [220, 0]
+      "position": [
+        220,
+        0
+      ]
     },
     {
       "parameters": {
@@ -35,15 +45,27 @@
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
-            { "name": "id", "value": "=eq.{{ $('Normalize Input').item.json.tenant_id }}" },
-            { "name": "select", "value": "id,name,plan,region,status,health_score" }
+            {
+              "name": "id",
+              "value": "=eq.{{ $('Normalize Input').item.json.tenant_id }}"
+            },
+            {
+              "name": "select",
+              "value": "id,name,plan,region,status,health_score"
+            }
           ]
         },
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            }
           ]
         },
         "options": {}
@@ -52,7 +74,10 @@
       "name": "Fetch Tenant",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [440, 0]
+      "position": [
+        440,
+        0
+      ]
     },
     {
       "parameters": {
@@ -61,16 +86,31 @@
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
-            { "name": "tenant_id", "value": "=eq.{{ $('Normalize Input').item.json.tenant_id }}" },
-            { "name": "select", "value": "policy" },
-            { "name": "limit", "value": "1" }
+            {
+              "name": "tenant_id",
+              "value": "=eq.{{ $('Normalize Input').item.json.tenant_id }}"
+            },
+            {
+              "name": "select",
+              "value": "policy"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
           ]
         },
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            }
           ]
         },
         "options": {}
@@ -79,31 +119,69 @@
       "name": "Fetch Policy",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [660, 0]
+      "position": [
+        660,
+        0
+      ]
     },
     {
       "parameters": {
-        "jsCode": "const tenantRows = $('Fetch Tenant').first().json || [];\nconst policyRows = $('Fetch Policy').first().json || [];\nconst tenant = Array.isArray(tenantRows) ? tenantRows[0] : tenantRows;\nconst policyRow = Array.isArray(policyRows) ? policyRows[0] : policyRows;\nconst policy = (policyRow && policyRow.policy) || {};\n\n// Defensive defaults so callers never NPE on a missing policy column.\nconst defaults = {\n  retry: { max_attempts: 3, backoff: 'linear' },\n  approval: { required_over_usd: 1000, approver: 'csm' },\n  entitlements: { sso: false, api: false }\n};\n\nreturn [{\n  json: {\n    tenant_id: tenant && tenant.id,\n    tenant_name: tenant && tenant.name,\n    plan: tenant && tenant.plan,\n    region: tenant && tenant.region,\n    status: tenant && tenant.status,\n    health_score: tenant && tenant.health_score,\n    policy: {\n      retry: { ...defaults.retry, ...(policy.retry || {}) },\n      approval: { ...defaults.approval, ...(policy.approval || {}) },\n      entitlements: { ...defaults.entitlements, ...(policy.entitlements || {}) }\n    },\n    correlation_id: $('Normalize Input').first().json.correlation_id\n  }\n}];"
+        "jsCode": "const tenantRows = $('Fetch Tenant').first().json || [];\nconst policyRows = $('Fetch Policy').first().json || [];\nconst tenant = Array.isArray(tenantRows) ? tenantRows[0] : tenantRows;\nconst policyRow = Array.isArray(policyRows) ? policyRows[0] : policyRows;\nconst policy = (policyRow && policyRow.policy) || {};\n\n// Defensive defaults so callers never NPE on a missing policy column.\nconst defaults = {\n  retry: { max_attempts: 3, backoff: 'linear' },\n  approval: { required_over_usd: 1000, approver: 'csm', second_approver: 'ops-lead' },\n  entitlements: { sso: false, api: false }\n};\n\nreturn [{\n  json: {\n    tenant_id: tenant && tenant.id,\n    tenant_name: tenant && tenant.name,\n    plan: tenant && tenant.plan,\n    region: tenant && tenant.region,\n    status: tenant && tenant.status,\n    health_score: tenant && tenant.health_score,\n    policy: {\n      retry: { ...defaults.retry, ...(policy.retry || {}) },\n      approval: { ...defaults.approval, ...(policy.approval || {}) },\n      entitlements: { ...defaults.entitlements, ...(policy.entitlements || {}) }\n    },\n    correlation_id: $('Normalize Input').first().json.correlation_id\n  }\n}];"
       },
       "id": "merge",
       "name": "Merge Policy + Tenant",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [880, 0]
+      "position": [
+        880,
+        0
+      ]
     }
   ],
   "connections": {
     "Execute Workflow Trigger": {
-      "main": [[{ "node": "Normalize Input", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Normalize Input": {
-      "main": [[{ "node": "Fetch Tenant", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fetch Tenant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Fetch Tenant": {
-      "main": [[{ "node": "Fetch Policy", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fetch Policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Fetch Policy": {
-      "main": [[{ "node": "Merge Policy + Tenant", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Merge Policy + Tenant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   }
 }

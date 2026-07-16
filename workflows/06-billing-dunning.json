@@ -7,8 +7,12 @@
     "errorWorkflow": "a10b0000-0000-4000-8000-000000000005"
   },
   "tags": [
-    { "name": "flowops" },
-    { "name": "service" }
+    {
+      "name": "flowops"
+    },
+    {
+      "name": "service"
+    }
   ],
   "nodes": [
     {
@@ -16,13 +20,18 @@
         "httpMethod": "POST",
         "path": "stripe-dunning",
         "responseMode": "responseNode",
-        "options": {}
+        "options": {
+          "rawBody": true
+        }
       },
       "id": "dunning-webhook",
       "name": "Stripe Dunning Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [0, 300],
+      "position": [
+        0,
+        300
+      ],
       "webhookId": "stripe-dunning"
     },
     {
@@ -31,19 +40,25 @@
       "name": "Replay Entry",
       "type": "n8n-nodes-base.executeWorkflowTrigger",
       "typeVersion": 1,
-      "position": [0, 560],
+      "position": [
+        0,
+        560
+      ],
       "notesInFlow": true,
       "notes": "Contract B: 05-dlq-replay re-injects the failed event here with replay:true + the original correlation_id, bypassing the webhook response + idempotency gate."
     },
     {
       "parameters": {
-        "jsCode": "// --- Ingress: normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe invoice.payment_failed event.\nfunction uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\n// Stripe shape: { type: 'invoice.payment_failed', data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || root.tenant_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'Unknown Tenant';\nconst source = body.source || (body.type ? 'stripe' : 'manual');\n\n// Lead-owned idempotency key derivation: stable source id, NEVER random (Contract G).\n// Prefer the Stripe event id (unique per failed-payment attempt). If absent (manual\n// demo), fall back to a STABLE composite of the invoice + attempt so retries of the\n// same failed invoice dedupe correctly. No Date.now()/random — that would defeat dedup.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst stripe_invoice_id_early = stripeObj.id || body.stripe_invoice_id || null;\nconst attempt_early = stripeObj.attempt_count != null ? Number(stripeObj.attempt_count) : (body.attempt || 1);\nconst idem_key = 'dunning:' + (event_id || (tenant_id + ':' + (stripe_invoice_id_early || 'noinv') + ':' + attempt_early));\n\n// Contract B replay: 05-dlq-replay re-enters via the Execute Workflow Trigger with\n// {body: <original trigger>, correlation_id, tenant_id, replay:true}. Preserve the\n// original correlation_id and mark the run so it bypasses the idempotency gate.\nconst replay = !!root.replay;\nconst src = replay ? 'replay' : source;\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\n// On replay, reuse the original correlation_id so the failure, the redrive, and the\n// re-run all thread onto one correlation-ID search.\nconst correlation_id = (replay && root.correlation_id) ? root.correlation_id : uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    source: src,\n    event_id,\n    idem_key, correlation_id,\n    replay,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    // Stripe invoice fields we need\n    stripe_invoice_id: stripeObj.id || body.stripe_invoice_id || null,\n    amount_usd: stripeObj.amount_due != null ? Number(stripeObj.amount_due) / 100 : (body.amount_usd || 0),\n    attempt: stripeObj.attempt_count != null ? Number(stripeObj.attempt_count) : (body.attempt || 1),\n    customer_email: stripeObj.customer_email || body.customer_email || email,\n    // For manual demo: allow overriding\n    invoice_status: body.invoice_status || (stripeObj.status || 'payment_failed')\n  }\n}];"
+        "jsCode": "function uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\nfunction headerValue(headers, name) {\n  const target = name.toLowerCase();\n  for (const [key, value] of Object.entries(headers || {})) {\n    if (String(key).toLowerCase() === target) return Array.isArray(value) ? value[0] : value;\n  }\n  return '';\n}\nfunction parseStripeSignature(header) {\n  const out = { t: null, v1: [] };\n  for (const part of String(header || '').split(',')) {\n    const idx = part.indexOf('=');\n    if (idx === -1) continue;\n    const key = part.slice(0, idx).trim();\n    const value = part.slice(idx + 1).trim();\n    if (key === 't') out.t = value;\n    if (key === 'v1') out.v1.push(value);\n  }\n  return out;\n}\nfunction hex(buffer) {\n  return Array.from(new Uint8Array(buffer)).map((b) => b.toString(16).padStart(2, '0')).join('');\n}\nfunction constantTimeEqual(a, b) {\n  const left = String(a || '').toLowerCase();\n  const right = String(b || '').toLowerCase();\n  let diff = left.length ^ right.length;\n  const max = Math.max(left.length, right.length);\n  for (let i = 0; i < max; i++) diff |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);\n  return diff === 0;\n}\nasync function hmacSha256Hex(secret, payload) {\n  const nodeCrypto = require('crypto');\n  return nodeCrypto.createHmac('sha256', secret).update(payload).digest('hex');\n}\nasync function verifyStripe(root, replay) {\n  const response_required = !!root.headers && !replay;\n  if (!response_required) return { response_required, authorized: true, auth_error: null, rawPayload: null };\n  const secret = $env.STRIPE_WEBHOOK_SECRET || '';\n  if (!secret) return { response_required, authorized: false, auth_error: 'missing STRIPE_WEBHOOK_SECRET', rawPayload: null };\n  const signature = headerValue(root.headers, 'stripe-signature');\n  if (!signature) return { response_required, authorized: false, auth_error: 'missing Stripe-Signature header', rawPayload: null };\n  const binary = $input.first().binary && $input.first().binary.data && $input.first().binary.data.data;\n  const rawPayload = binary ? Buffer.from(binary, 'base64').toString('utf8') : (typeof root.body === 'string' ? root.body : JSON.stringify(root.body || {}));\n  const parsed = parseStripeSignature(signature);\n  if (!parsed.t || parsed.v1.length === 0) return { response_required, authorized: false, auth_error: 'malformed Stripe-Signature header', rawPayload };\n  const tolerance = Number($env.STRIPE_WEBHOOK_TOLERANCE_SECONDS || 300);\n  const timestamp = Number(parsed.t);\n  if (!Number.isFinite(timestamp)) return { response_required, authorized: false, auth_error: 'invalid Stripe-Signature timestamp', rawPayload };\n  if (Number.isFinite(tolerance) && tolerance > 0 && Math.abs(Math.floor(Date.now() / 1000) - timestamp) > tolerance) {\n    return { response_required, authorized: false, auth_error: 'expired Stripe-Signature timestamp', rawPayload };\n  }\n  const expected = await hmacSha256Hex(secret, parsed.t + '.' + rawPayload);\n  const authorized = parsed.v1.some((sig) => constantTimeEqual(sig, expected));\n  return { response_required, authorized, auth_error: authorized ? null : 'invalid Stripe-Signature digest', rawPayload };\n}\n\n// --- Ingress: verify Stripe signature, normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe invoice.payment_failed event.\nconst root = $input.first().json || {};\nconst replay = !!root.replay;\nconst verification = await verifyStripe(root, replay);\nlet body = root.body || root;\nif (verification.rawPayload) {\n  try {\n    body = JSON.parse(verification.rawPayload);\n  } catch (e) {\n    verification.authorized = false;\n    verification.auth_error = 'invalid JSON payload';\n    body = {};\n  }\n}\n// Stripe shape: { type: 'invoice.payment_failed', data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || root.tenant_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'Unknown Tenant';\nconst source = body.source || (body.type ? 'stripe' : 'manual');\n\n// Lead-owned idempotency key derivation: stable source id, NEVER random (Contract G).\n// Prefer the Stripe event id (unique per failed-payment attempt). If absent (manual\n// demo), fall back to a STABLE composite of the invoice + attempt so retries of the\n// same failed invoice dedupe correctly. No Date.now()/random - that would defeat dedup.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst stripe_invoice_id_early = stripeObj.id || body.stripe_invoice_id || null;\nconst attempt_early = stripeObj.attempt_count != null ? Number(stripeObj.attempt_count) : (body.attempt || 1);\nconst idem_key = 'dunning:' + (event_id || (tenant_id + ':' + (stripe_invoice_id_early || 'noinv') + ':' + attempt_early));\n\n// Contract B replay: 05-dlq-replay re-enters via the Execute Workflow Trigger with\n// {body: <original trigger>, correlation_id, tenant_id, replay:true}. Preserve the\n// original correlation_id and mark the run so it bypasses the idempotency gate.\nconst src = replay ? 'replay' : source;\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\n// On replay, reuse the original correlation_id so the failure, the redrive, and the\n// re-run all thread onto one correlation-ID search.\nconst correlation_id = (replay && root.correlation_id) ? root.correlation_id : uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    source: src,\n    event_id,\n    idem_key, correlation_id,\n    replay,\n    response_required: verification.response_required,\n    authorized: verification.authorized,\n    auth_error: verification.auth_error,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    // Stripe invoice fields we need\n    stripe_invoice_id: stripeObj.id || body.stripe_invoice_id || null,\n    amount_usd: stripeObj.amount_due != null ? Number(stripeObj.amount_due) / 100 : (body.amount_usd || 0),\n    attempt: stripeObj.attempt_count != null ? Number(stripeObj.attempt_count) : (body.attempt || 1),\n    customer_email: stripeObj.customer_email || body.customer_email || email,\n    // For manual demo: allow overriding\n    invoice_status: body.invoice_status || (stripeObj.status || 'payment_failed')\n  }\n}];"
       },
       "id": "normalize",
       "name": "Gen Correlation + Normalize",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [220, 300]
+      "position": [
+        220,
+        300
+      ]
     },
     {
       "parameters": {
@@ -72,7 +87,10 @@
       "name": "Is Replay?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [330, 300],
+      "position": [
+        330,
+        300
+      ],
       "notesInFlow": true,
       "notes": "Replay re-runs a known event on operator demand: skip the webhook response + idempotency gate (which would dedupe it as already-seen) and go straight to provisioning."
     },
@@ -88,7 +106,10 @@
       "name": "Respond Queued",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [560, 140]
+      "position": [
+        560,
+        140
+      ]
     },
     {
       "parameters": {
@@ -98,7 +119,10 @@
       "name": "Prep Idempotency Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [560, 300]
+      "position": [
+        560,
+        300
+      ]
     },
     {
       "parameters": {
@@ -109,7 +133,10 @@
       "name": "Idempotency Check",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [760, 300]
+      "position": [
+        760,
+        300
+      ]
     },
     {
       "parameters": {
@@ -138,7 +165,10 @@
       "name": "Is Duplicate?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [880, 300]
+      "position": [
+        880,
+        300
+      ]
     },
     {
       "parameters": {
@@ -148,7 +178,10 @@
       "name": "Prep Audit: Duplicate",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 140]
+      "position": [
+        1100,
+        140
+      ]
     },
     {
       "parameters": {
@@ -159,7 +192,10 @@
       "name": "Audit: Duplicate",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [1320, 140]
+      "position": [
+        1320,
+        140
+      ]
     },
     {
       "parameters": {
@@ -169,7 +205,10 @@
       "name": "Prep Resolve Input",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 420]
+      "position": [
+        1100,
+        420
+      ]
     },
     {
       "parameters": {
@@ -180,7 +219,10 @@
       "name": "Resolve Policy",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [1320, 420]
+      "position": [
+        1320,
+        420
+      ]
     },
     {
       "parameters": {
@@ -190,7 +232,10 @@
       "name": "Prep Audit: Started",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1540, 420]
+      "position": [
+        1540,
+        420
+      ]
     },
     {
       "parameters": {
@@ -201,7 +246,10 @@
       "name": "Audit: Started",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [1760, 420]
+      "position": [
+        1760,
+        420
+      ]
     },
     {
       "parameters": {
@@ -210,10 +258,22 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Content-Type", "value": "application/json" },
-            { "name": "Prefer", "value": "resolution=merge-duplicates,return=representation" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "resolution=merge-duplicates,return=representation"
+            }
           ]
         },
         "sendBody": true,
@@ -225,7 +285,10 @@
       "name": "Upsert Invoice",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1980, 420],
+      "position": [
+        1980,
+        420
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -236,15 +299,30 @@
       "name": "Check Escalation?",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2200, 420]
+      "position": [
+        2200,
+        420
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
           "combinator": "and",
           "conditions": [
-            { "id": "escalate", "leftValue": "={{ $json.isFinal }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true", "singleValue": true } }
+            {
+              "id": "escalate",
+              "leftValue": "={{ $json.isFinal }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
           ]
         },
         "options": {}
@@ -253,7 +331,10 @@
       "name": "Escalate to Suspended?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [2420, 420]
+      "position": [
+        2420,
+        420
+      ]
     },
     {
       "parameters": {
@@ -262,10 +343,22 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Content-Type", "value": "application/json" },
-            { "name": "Prefer", "value": "return=representation" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
           ]
         },
         "sendBody": true,
@@ -277,7 +370,10 @@
       "name": "Suspend Tenant",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2640, 260],
+      "position": [
+        2640,
+        260
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -287,10 +383,22 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Content-Type", "value": "application/json" },
-            { "name": "Prefer", "value": "return=representation" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
           ]
         },
         "sendBody": true,
@@ -302,7 +410,10 @@
       "name": "Push Health Signal",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2640, 420],
+      "position": [
+        2640,
+        420
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -313,7 +424,10 @@
       "name": "Compute Health Penalty",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2860, 420]
+      "position": [
+        2860,
+        420
+      ]
     },
     {
       "parameters": {
@@ -322,8 +436,14 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            }
           ]
         },
         "options": {}
@@ -332,7 +452,10 @@
       "name": "Fetch Current Health",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [3080, 420],
+      "position": [
+        3080,
+        420
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -343,7 +466,10 @@
       "name": "Compute New Health Score",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3300, 420]
+      "position": [
+        3300,
+        420
+      ]
     },
     {
       "parameters": {
@@ -352,10 +478,22 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Authorization", "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}" },
-            { "name": "Content-Type", "value": "application/json" },
-            { "name": "Prefer", "value": "return=representation" }
+            {
+              "name": "apikey",
+              "value": "={{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SUPABASE_SERVICE_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
           ]
         },
         "sendBody": true,
@@ -367,7 +505,10 @@
       "name": "Decrement Health Score",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [3520, 420],
+      "position": [
+        3520,
+        420
+      ],
       "onError": "continueRegularOutput"
     },
     {
@@ -378,7 +519,10 @@
       "name": "Notify Telegram",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3300, 420]
+      "position": [
+        3300,
+        420
+      ]
     },
     {
       "parameters": {
@@ -388,7 +532,10 @@
       "name": "Prep Audit: Success",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3520, 420]
+      "position": [
+        3520,
+        420
+      ]
     },
     {
       "parameters": {
@@ -399,90 +546,366 @@
       "name": "Audit: Success",
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
-      "position": [3740, 420]
+      "position": [
+        3740,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-authorized",
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-authorized",
+      "name": "Is Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        330,
+        300
+      ],
+      "notesInFlow": true,
+      "notes": "Public Stripe webhook calls must carry a valid Stripe-Signature for STRIPE_WEBHOOK_SECRET. Replay entries are in-process and trusted."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: 'unauthorized', reason: $('Gen Correlation + Normalize').first().json.auth_error || 'invalid Stripe signature' }) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "respond-unauthorized",
+      "name": "Respond Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        560,
+        140
+      ]
     }
   ],
   "connections": {
     "Stripe Dunning Webhook": {
-      "main": [[{ "node": "Gen Correlation + Normalize", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Gen Correlation + Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Replay Entry": {
-      "main": [[{ "node": "Gen Correlation + Normalize", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Gen Correlation + Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Gen Correlation + Normalize": {
-      "main": [[{ "node": "Is Replay?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Is Authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Is Replay?": {
       "main": [
-        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }],
-        [{ "node": "Respond Queued", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Respond Queued": {
-      "main": [[{ "node": "Prep Idempotency Input", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Idempotency Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Idempotency Input": {
-      "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Idempotency Check": {
-      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Is Duplicate?": {
       "main": [
-        [{ "node": "Prep Audit: Duplicate", "type": "main", "index": 0 }],
-        [{ "node": "Prep Resolve Input", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Prep Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep Resolve Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Prep Audit: Duplicate": {
-      "main": [[{ "node": "Audit: Duplicate", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Resolve Input": {
-      "main": [[{ "node": "Resolve Policy", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Resolve Policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Resolve Policy": {
-      "main": [[{ "node": "Prep Audit: Started", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Started": {
-      "main": [[{ "node": "Audit: Started", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Started",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Audit: Started": {
-      "main": [[{ "node": "Upsert Invoice", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Upsert Invoice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Upsert Invoice": {
-      "main": [[{ "node": "Check Escalation?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Check Escalation?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Check Escalation?": {
-      "main": [[{ "node": "Escalate to Suspended?", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Escalate to Suspended?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Escalate to Suspended?": {
       "main": [
-        [{ "node": "Suspend Tenant", "type": "main", "index": 0 }],
-        [{ "node": "Push Health Signal", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Suspend Tenant",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Push Health Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Suspend Tenant": {
-      "main": [[{ "node": "Push Health Signal", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Push Health Signal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Push Health Signal": {
-      "main": [[{ "node": "Compute Health Penalty", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Compute Health Penalty",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Compute Health Penalty": {
-      "main": [[{ "node": "Fetch Current Health", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Fetch Current Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Fetch Current Health": {
-      "main": [[{ "node": "Compute New Health Score", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Compute New Health Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Compute New Health Score": {
-      "main": [[{ "node": "Decrement Health Score", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Decrement Health Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Decrement Health Score": {
-      "main": [[{ "node": "Notify Telegram", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Notify Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Notify Telegram": {
-      "main": [[{ "node": "Prep Audit: Success", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Prep Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Prep Audit: Success": {
-      "main": [[{ "node": "Audit: Success", "type": "main", "index": 0 }]]
+      "main": [
+        [
+          {
+            "node": "Audit: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   }
 }

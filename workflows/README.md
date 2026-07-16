@@ -21,6 +21,8 @@ Lead-owned n8n automation. Exported workflow JSON, importable into the queue-mod
 | `12-revenue-reconciliation.json` | Service 10 | Daily/manual reconciliation → missing invoice + entitlement drift findings → `reconciliation_runs` + audit. |
 | `13-compliance-reporting.json` | Service 11 | Daily/manual compliance export → tenant-scoped audit/DLQ/DSAR/retention report → `compliance_exports` + audit. |
 | `14-identity-lifecycle.json` | Service 2 | `POST /webhook/identity-lifecycle` → SCIM-style seat upsert/revoke/reconcile → `seats` + audit. |
+| `15-approval-reminders.json` | approval ops | Hourly scan of `v_pending_approvals` → Telegram reminders → second-approver escalation → `approvals/*` audit rows. |
+| `16-telegram-approve.json` | approval backbone | Reusable Telegram HITL approval: writes the `waiting` audit row, sends approve/reject buttons, waits for resume, and returns `{decision, approved}`. |
 
 ## Environment
 
@@ -33,7 +35,14 @@ values in `../.env`:
 | `SUPABASE_SERVICE_KEY` | `apikey` + `Authorization: Bearer` on every DB call |
 | `N8N_DOMAIN` | n8n's own public URL (= ngrok / `WEBHOOK_URL`); used to call `/webhook/idempotency-check` |
 | `TELEGRAM_CHAT_ID` | approver / CSM chat for HITL + notifications |
-| `TELEGRAM_BOT_TOKEN` | non-throwing Telegram alerts from Code nodes (global error, dunning, incident comms) |
+| `TELEGRAM_BOT_TOKEN` | Telegram alerts and reusable HITL approvals from Code nodes (`16`, global error, dunning, incident comms) |
+| `TELEGRAM_ESCALATION_CHAT_ID` | optional second-approver chat for approval SLA escalations; falls back to `TELEGRAM_CHAT_ID` |
+| `FLOWOPS_SECOND_APPROVER` | fallback second-approver label when tenant policy omits `approval.second_approver` (default `ops-lead`) |
+| `APPROVAL_REMINDER_AFTER_MINUTES` | pending approval age before first reminder (default `30`) |
+| `APPROVAL_ESCALATION_AFTER_MINUTES` | pending approval age before second-approver escalation (default `120`) |
+| `APPROVAL_REMINDER_REPEAT_MINUTES` | minimum time between repeated reminders for the same waiting row (default `60`) |
+| `STRIPE_WEBHOOK_SECRET` | Stripe endpoint signing secret for `03` and `06`; public Stripe webhook calls fail closed when absent/invalid |
+| `STRIPE_WEBHOOK_TOLERANCE_SECONDS` | max accepted Stripe signature age (default `300`; set `0` only for local debugging) |
 | `GITHUB_TOKEN` | GitHub Issues API for Service 4 scans/comments |
 | `GITHUB_REPO` | `owner/repo` scanned by Service 4 cron path |
 | `GITHUB_SLA_LABEL` | issue label scanned for SLA breaches (default `sla-watch`) |
@@ -46,8 +55,9 @@ No Supabase n8n *credential* is needed — auth is via `$env` headers.
 
 ## Credentials to create in n8n (once)
 
-- **`telegramBot`** (type *Telegram API*) — bot token from `@BotFather`. The two Telegram nodes in
-  `03` reference it by name; n8n prompts to map on import.
+- **`telegramBot`** (type *Telegram API*) - bot token from `@BotFather`. `03` still uses this
+  credential for its post-approval CSM notification; reusable approvals in `16` use
+  `TELEGRAM_BOT_TOKEN` directly.
 
 ## Import order
 
@@ -56,39 +66,68 @@ No Supabase n8n *credential* is needed — auth is via `$env` headers.
    then `03-onboarding.json`, `04-global-error-handler.json`, `05-dlq-replay.json`,
    `06-billing-dunning.json`, `07-support-sla-escalation.json`, `08-incident-comms.json`,
    `09-health-churn-risk.json`, `10-renewal-expansion.json`, `11-dsar-privacy.json`,
-   `12-revenue-reconciliation.json`, `13-compliance-reporting.json`, and
-   `14-identity-lifecycle.json`.
-3. **Activate `00`, `01`, and `02`.** All three are called by service workflows as **Execute Workflow**
+   `12-revenue-reconciliation.json`, `13-compliance-reporting.json`,
+   `14-identity-lifecycle.json`, `15-approval-reminders.json`, and `16-telegram-approve.json`.
+3. **Activate `00`, `01`, `02`, and `16`.** These are called by service workflows as **Execute Workflow**
    nodes, and current `n8nio/n8n` refuses to run an inactive called workflow
    ("Workflow is not active and cannot be executed"). `02` additionally exposes
    `POST /webhook/idempotency-check`, which likewise only serves while active.
 4. In service workflows, open the **Execute Workflow** nodes (`Idempotency Check`, `Resolve Policy`,
    `Audit: *`) and confirm they point at the imported `00` / `01` / `02` (n8n may need a
    re-select — the stable workflow ids `a10b0000-…0001/0002/0004` help it auto-link).
-5. Map the `telegramBot` credential on Telegram nodes in `03` and `07`.
-6. **Activate** `03`, `05`, `06`, `07`, `08`, `09`, `10`, `11`, `12`, `13`, and `14` after their called sub-workflows are active.
+5. Map the `telegramBot` credential on Telegram nodes in `03`.
+6. **Activate** `03`, `05`, `06`, `07`, `08`, `09`, `10`, `11`, `12`, `13`, `14`, and `15` after their called sub-workflows are active.
 
 ## Verify end-to-end
 
-Happy path (no approval — amount under policy threshold):
+Stripe webhook requests must be signed. For manual local smoke tests, build the payload first and
+send the `Stripe-Signature` header exactly as Stripe does (`t=<unix>,v1=<hmac>`):
+
 ```bash
+payload='{"tenant_id":"11111111-1111-1111-1111-111111111111","email":"ops@acme.com","plan":"enterprise","amount_usd":0,"event_id":"evt_demo_1"}'
+ts="$(date +%s)"
+sig="$(printf '%s.%s' "$ts" "$payload" | openssl dgst -sha256 -hmac "$STRIPE_WEBHOOK_SECRET" -hex | sed 's/^.* //')"
 curl -XPOST "$N8N_DOMAIN/webhook/stripe-onboarding" \
   -H 'content-type: application/json' \
-  -d '{"tenant_id":"11111111-1111-1111-1111-111111111111","email":"ops@acme.com","plan":"enterprise","amount_usd":0,"event_id":"evt_demo_1"}'
+  -H "Stripe-Signature: t=$ts,v1=$sig" \
+  --data "$payload"
 ```
+
+Unsigned or stale public calls return `401` before the workflow queues, writes idempotency keys, or
+touches Supabase. DLQ replay enters via the internal Execute Workflow trigger and remains trusted.
+
+Happy path (no approval - amount under policy threshold): use the signed onboarding example above
+with `amount_usd: 0`.
 Expect `{"status":"queued","correlation_id":"..."}`; then a tenant upsert, a seat, entitlements, and
 an `onboarding` audit trace searchable by that `correlation_id`.
 
 HITL path (amount over `policy.approval.required_over_usd`):
 ```bash
+payload='{"tenant_id":"11111111-1111-1111-1111-111111111111","email":"ops@acme.com","plan":"enterprise","amount_usd":15000,"event_id":"evt_demo_2"}'
+ts="$(date +%s)"
+sig="$(printf '%s.%s' "$ts" "$payload" | openssl dgst -sha256 -hmac "$STRIPE_WEBHOOK_SECRET" -hex | sed 's/^.* //')"
 curl -XPOST "$N8N_DOMAIN/webhook/stripe-onboarding" \
   -H 'content-type: application/json' \
-  -d '{"tenant_id":"11111111-1111-1111-1111-111111111111","email":"ops@acme.com","plan":"enterprise","amount_usd":15000,"event_id":"evt_demo_2"}'
+  -H "Stripe-Signature: t=$ts,v1=$sig" \
+  --data "$payload"
 ```
 A Telegram message with **Approve / Reject** buttons arrives. Tap **Approve** → entitlements granted
 + `success` audit row. Tap **Reject** → `skipped` audit row, no entitlements.
 
 Idempotency: replay either call with the **same `event_id`** → the second run is deduped (one effect).
+
+Service 3 dunning uses the same Stripe signature gate:
+```bash
+payload='{"tenant_id":"22222222-2222-2222-2222-222222222222","tenant_name":"Globex Inc","stripe_invoice_id":"in_demo_failed_1","amount_usd":2500,"attempt":1,"event_id":"evt_dunning_demo_1"}'
+ts="$(date +%s)"
+sig="$(printf '%s.%s' "$ts" "$payload" | openssl dgst -sha256 -hmac "$STRIPE_WEBHOOK_SECRET" -hex | sed 's/^.* //')"
+curl -XPOST "$N8N_DOMAIN/webhook/stripe-dunning" \
+  -H 'content-type: application/json' \
+  -H "Stripe-Signature: t=$ts,v1=$sig" \
+  --data "$payload"
+```
+Expect `{"status":"queued","correlation_id":"..."}`, an invoice upsert, health impact, and a
+`dunning/complete` audit row.
 
 Service 2 identity lifecycle / SCIM-style seat reconciliation:
 ```bash
@@ -175,9 +214,17 @@ Markdown + JSON report data, and `compliance/build-export` + `compliance/export`
   NOTHING` on `idempotency_keys`. `03` calls it **in-process** as an Execute Workflow node
   (`Idempotency Check` → `02`), so there is no `N8N_DOMAIN` / HTTP hop and no racy fallback.
   `02` is *also* reachable at `POST /webhook/idempotency-check` for out-of-process callers.
-- **HITL**: Wait node (`resume: webhook`) exposes `$execution.resumeUrl`; the Telegram message's two
-  URL buttons append `?decision=approve|reject`. Wait + Telegram live in the same execution, as n8n
-  requires for `resumeUrl`.
+- **HITL**: `03-onboarding` and `07-support-sla-escalation` call `16-telegram-approve`.
+  `16` owns the Wait node (`resume: webhook`), writes the `waiting` audit row with
+  `approval_url` / `approve_url` / `reject_url`, sends Telegram approve/reject buttons,
+  and returns `decision` to the caller. The reusable workflow rewrites n8n's generated
+  resume URL to `WEBHOOK_URL` / `N8N_DOMAIN` before sending it to Telegram so local runs
+  use the public ngrok URL. Callers keep their service-specific approved/rejected audit
+  rows and downstream side effects.
+- **Approval reminders**: HITL workflows persist the resume URL in the `waiting` audit payload.
+  `15-approval-reminders` scans `v_pending_approvals` hourly, sends a reminder after
+  `APPROVAL_REMINDER_AFTER_MINUTES`, escalates once after `APPROVAL_ESCALATION_AFTER_MINUTES`, and
+  writes dedupe/audit rows under `service='approvals'`.
 
 ## Known import caveats (hand-authored JSON)
 
@@ -188,6 +235,5 @@ Markdown + JSON report data, and `compliance/build-export` + `compliance/export`
 
 ## Deferred (not in Contract B)
 
-- `telegram-approve` extracted as its own reusable sub-workflow (currently inline in `03`).
-- Approval **reminder cron** + **SLA escalation** to a second approver.
-- Stripe **signature verification** on the webhook.
+- Separate Stripe endpoint secrets per service if billing/onboarding are split across Stripe
+  endpoints; current local stack uses one `STRIPE_WEBHOOK_SECRET` for both.

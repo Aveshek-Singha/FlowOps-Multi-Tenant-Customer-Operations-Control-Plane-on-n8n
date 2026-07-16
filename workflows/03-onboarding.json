@@ -19,7 +19,9 @@
         "httpMethod": "POST",
         "path": "stripe-onboarding",
         "responseMode": "responseNode",
-        "options": {}
+        "options": {
+          "rawBody": true
+        }
       },
       "id": "onboarding-webhook",
       "name": "Onboarding Webhook",
@@ -46,7 +48,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// --- Ingress: normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe checkout.session.completed event.\nfunction uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\n\nconst root = $input.first().json || {};\nconst body = root.body || root;\n// Stripe shape: { type, data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || root.tenant_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'New Tenant';\nconst plan = body.plan || 'free';\nconst region = body.region || 'us-east-1';\n// amount in USD. Stripe amount_total is in cents.\nconst amount_usd = body.amount_usd != null\n  ? Number(body.amount_usd)\n  : (stripeObj.amount_total != null ? Number(stripeObj.amount_total) / 100 : 0);\n// Contract B replay: 05-dlq-replay re-enters via the Execute Workflow Trigger with\n// {body: <original trigger>, correlation_id, tenant_id, replay:true}. Preserve the\n// original correlation_id and mark the run so it bypasses the idempotency gate.\nconst replay = !!root.replay;\nconst source = replay ? 'replay' : (body.source || (body.type ? 'stripe' : 'manual'));\n\n// Lead-owned idempotency key derivation: stable source id, never random.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst idem_key = 'onboarding:' + (event_id || (tenant_id + ':' + email));\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\n// On replay, reuse the original correlation_id so the failure, the redrive, and the\n// re-run all thread onto one correlation-ID search.\nconst correlation_id = (replay && root.correlation_id) ? root.correlation_id : uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    plan,\n    region,\n    amount_usd,\n    source,\n    replay,\n    event_id,\n    idem_key,\n    correlation_id,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    n8n_domain: ($env.N8N_DOMAIN || '').replace(/\\/$/, '')\n  }\n}];"
+        "jsCode": "function uuidv4() {\n  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {\n    const r = Math.random() * 16 | 0;\n    const v = c === 'x' ? r : (r & 0x3 | 0x8);\n    return v.toString(16);\n  });\n}\nfunction headerValue(headers, name) {\n  const target = name.toLowerCase();\n  for (const [key, value] of Object.entries(headers || {})) {\n    if (String(key).toLowerCase() === target) return Array.isArray(value) ? value[0] : value;\n  }\n  return '';\n}\nfunction parseStripeSignature(header) {\n  const out = { t: null, v1: [] };\n  for (const part of String(header || '').split(',')) {\n    const idx = part.indexOf('=');\n    if (idx === -1) continue;\n    const key = part.slice(0, idx).trim();\n    const value = part.slice(idx + 1).trim();\n    if (key === 't') out.t = value;\n    if (key === 'v1') out.v1.push(value);\n  }\n  return out;\n}\nfunction hex(buffer) {\n  return Array.from(new Uint8Array(buffer)).map((b) => b.toString(16).padStart(2, '0')).join('');\n}\nfunction constantTimeEqual(a, b) {\n  const left = String(a || '').toLowerCase();\n  const right = String(b || '').toLowerCase();\n  let diff = left.length ^ right.length;\n  const max = Math.max(left.length, right.length);\n  for (let i = 0; i < max; i++) diff |= (left.charCodeAt(i) || 0) ^ (right.charCodeAt(i) || 0);\n  return diff === 0;\n}\nasync function hmacSha256Hex(secret, payload) {\n  const nodeCrypto = require('crypto');\n  return nodeCrypto.createHmac('sha256', secret).update(payload).digest('hex');\n}\nasync function verifyStripe(root, replay) {\n  const response_required = !!root.headers && !replay;\n  if (!response_required) return { response_required, authorized: true, auth_error: null, rawPayload: null };\n  const secret = $env.STRIPE_WEBHOOK_SECRET || '';\n  if (!secret) return { response_required, authorized: false, auth_error: 'missing STRIPE_WEBHOOK_SECRET', rawPayload: null };\n  const signature = headerValue(root.headers, 'stripe-signature');\n  if (!signature) return { response_required, authorized: false, auth_error: 'missing Stripe-Signature header', rawPayload: null };\n  const binary = $input.first().binary && $input.first().binary.data && $input.first().binary.data.data;\n  const rawPayload = binary ? Buffer.from(binary, 'base64').toString('utf8') : (typeof root.body === 'string' ? root.body : JSON.stringify(root.body || {}));\n  const parsed = parseStripeSignature(signature);\n  if (!parsed.t || parsed.v1.length === 0) return { response_required, authorized: false, auth_error: 'malformed Stripe-Signature header', rawPayload };\n  const tolerance = Number($env.STRIPE_WEBHOOK_TOLERANCE_SECONDS || 300);\n  const timestamp = Number(parsed.t);\n  if (!Number.isFinite(timestamp)) return { response_required, authorized: false, auth_error: 'invalid Stripe-Signature timestamp', rawPayload };\n  if (Number.isFinite(tolerance) && tolerance > 0 && Math.abs(Math.floor(Date.now() / 1000) - timestamp) > tolerance) {\n    return { response_required, authorized: false, auth_error: 'expired Stripe-Signature timestamp', rawPayload };\n  }\n  const expected = await hmacSha256Hex(secret, parsed.t + '.' + rawPayload);\n  const authorized = parsed.v1.some((sig) => constantTimeEqual(sig, expected));\n  return { response_required, authorized, auth_error: authorized ? null : 'invalid Stripe-Signature digest', rawPayload };\n}\n\n// --- Ingress: verify Stripe signature, normalize body, derive correlation id + idempotency key ---\n// Accepts both the manual demo body and a Stripe checkout.session.completed event.\nconst root = $input.first().json || {};\nconst replay = !!root.replay;\nconst verification = await verifyStripe(root, replay);\nlet body = root.body || root;\nif (verification.rawPayload) {\n  try {\n    body = JSON.parse(verification.rawPayload);\n  } catch (e) {\n    verification.authorized = false;\n    verification.auth_error = 'invalid JSON payload';\n    body = {};\n  }\n}\n// Stripe shape: { type, data: { object: {...} } }\nconst stripeObj = (body.data && body.data.object) || {};\n\nconst tenant_id = body.tenant_id || stripeObj.client_reference_id || root.tenant_id || null;\nconst email = body.email || stripeObj.customer_email || stripeObj.customer_details?.email || '';\nconst tenant_name = body.tenant_name || body.name || stripeObj.customer_details?.name || 'New Tenant';\nconst plan = body.plan || 'free';\nconst region = body.region || 'us-east-1';\n// amount in USD. Stripe amount_total is in cents.\nconst amount_usd = body.amount_usd != null\n  ? Number(body.amount_usd)\n  : (stripeObj.amount_total != null ? Number(stripeObj.amount_total) / 100 : 0);\n// Contract B replay: 05-dlq-replay re-enters via the Execute Workflow Trigger with\n// {body: <original trigger>, correlation_id, tenant_id, replay:true}. Preserve the\n// original correlation_id and mark the run so it bypasses the idempotency gate.\nconst source = replay ? 'replay' : (body.source || (body.type ? 'stripe' : 'manual'));\n\n// Lead-owned idempotency key derivation: stable source id, never random.\nconst event_id = body.event_id || body.id || stripeObj.id || null;\nconst idem_key = 'onboarding:' + (event_id || (tenant_id + ':' + email));\n\n// correlation_id must be a valid uuid (audit_log.correlation_id is uuid not null).\n// On replay, reuse the original correlation_id so the failure, the redrive, and the\n// re-run all thread onto one correlation-ID search.\nconst correlation_id = (replay && root.correlation_id) ? root.correlation_id : uuidv4();\n\nreturn [{\n  json: {\n    tenant_id,\n    tenant_name,\n    email,\n    plan,\n    region,\n    amount_usd,\n    source,\n    replay,\n    response_required: verification.response_required,\n    authorized: verification.authorized,\n    auth_error: verification.auth_error,\n    event_id,\n    idem_key,\n    correlation_id,\n    execution_id: String($execution.id),\n    supabase_url: ($env.SUPABASE_URL || '').replace(/\\/$/, ''),\n    service_key: $env.SUPABASE_SERVICE_KEY || '',\n    n8n_domain: ($env.N8N_DOMAIN || '').replace(/\\/$/, '')\n  }\n}];"
       },
       "id": "normalize",
       "name": "Gen Correlation + Normalize",
@@ -359,50 +361,6 @@
     },
     {
       "parameters": {
-        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
-        "text": "=\ud83d\udd14 *Onboarding approval needed*\nTenant: {{ $('Resolve Policy').item.json.tenant_name }} ({{ $('Resolve Policy').item.json.plan }})\nAmount: ${{ $('Gen Correlation + Normalize').item.json.amount_usd }}\nApprover: {{ $('Resolve Policy').item.json.policy.approval.approver }}\nCorrelation: `{{ $('Gen Correlation + Normalize').item.json.correlation_id }}`",
-        "additionalFields": {
-          "parse_mode": "Markdown",
-          "reply_markup": "={{ JSON.stringify({ inline_keyboard: [[ { text: '\u2705 Approve', url: $execution.resumeUrl + '?decision=approve' }, { text: '\u274c Reject', url: $execution.resumeUrl + '?decision=reject' } ]] }) }}"
-        }
-      },
-      "id": "send-approval",
-      "name": "Send Approval Request",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
-      "position": [
-        2640,
-        260
-      ],
-      "credentials": {
-        "telegramApi": {
-          "id": "telegramBot",
-          "name": "telegramBot"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "resume": "webhook",
-        "options": {
-          "limitWaitTime": true,
-          "limitType": "afterTimeInterval",
-          "resumeAmount": 24,
-          "resumeUnit": "hours"
-        }
-      },
-      "id": "wait-approval",
-      "name": "Wait For Approval",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1.1,
-      "position": [
-        2860,
-        260
-      ],
-      "webhookId": "onboarding-approval-resume"
-    },
-    {
-      "parameters": {
         "conditions": {
           "options": {
             "caseSensitive": true,
@@ -412,7 +370,7 @@
           "conditions": [
             {
               "id": "is-approve",
-              "leftValue": "={{ $json.query.decision }}",
+              "leftValue": "={{ $json.decision }}",
               "rightValue": "approve",
               "operator": {
                 "type": "string",
@@ -428,7 +386,7 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        3080,
+        3520,
         260
       ]
     },
@@ -441,14 +399,14 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3300,
+        3740,
         420
       ]
     },
     {
       "parameters": {
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
-        "text": "=\u2705 *Tenant onboarded*\n{{ $('Resolve Policy').item.json.tenant_name }} ({{ $('Resolve Policy').item.json.plan }}) provisioned.\nEntitlements: {{ $('Grant Entitlements').item.json.granted }} applied.\nCorrelation: `{{ $('Gen Correlation + Normalize').item.json.correlation_id }}`",
+        "text": "=✅ *Tenant onboarded*\n{{ $('Resolve Policy').item.json.tenant_name }} ({{ $('Resolve Policy').item.json.plan }}) provisioned.\nEntitlements: {{ $('Grant Entitlements').item.json.granted }} applied.\nCorrelation: `{{ $('Gen Correlation + Normalize').item.json.correlation_id }}`",
         "additionalFields": {
           "parse_mode": "Markdown"
         }
@@ -458,7 +416,7 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        3520,
+        3960,
         420
       ],
       "credentials": {
@@ -477,7 +435,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3740,
+        4180,
         420
       ]
     },
@@ -491,20 +449,20 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
       "position": [
-        3960,
+        4400,
         420
       ]
     },
     {
       "parameters": {
-        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'approval',\n  status: 'skipped',\n  payload: { decision: 'rejected', approver: $('Resolve Policy').first().json.policy.approval.approver }\n} }];"
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nconst approval = ($('Resolve Policy').first().json.policy && $('Resolve Policy').first().json.policy.approval) || {};\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'approval',\n  status: 'skipped',\n  payload: { decision: 'rejected', approver: approval.approver }\n} }];"
       },
       "id": "prep-audit-rejected",
       "name": "Prep Audit: Rejected",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3300,
+        3740,
         80
       ]
     },
@@ -518,8 +476,113 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1,
       "position": [
-        3520,
+        3960,
         80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst approval = (pol.policy && pol.policy.approval) || {};\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'approval',\n  status: 'success',\n  payload: { decision: 'approved', approver: approval.approver }\n} }];"
+      },
+      "id": "prep-audit-approved",
+      "name": "Prep Audit: Approved",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3300,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000002",
+        "options": {}
+      },
+      "id": "audit-approved",
+      "name": "Audit: Approved",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        3520,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-authorized",
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-authorized",
+      "name": "Is Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        330,
+        300
+      ],
+      "notesInFlow": true,
+      "notes": "Public Stripe webhook calls must carry a valid Stripe-Signature for STRIPE_WEBHOOK_SECRET. Replay entries are in-process and trusted."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: 'unauthorized', reason: $('Gen Correlation + Normalize').first().json.auth_error || 'invalid Stripe signature' }) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "respond-unauthorized",
+      "name": "Respond Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        550,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const p = $('Gen Correlation + Normalize').first().json;\nconst pol = $('Resolve Policy').first().json;\nconst approval = (pol.policy && pol.policy.approval) || {};\nconst text = [\n  'Onboarding approval needed',\n  'Tenant: ' + (pol.tenant_name || p.tenant_id) + ' (' + (pol.plan || 'unknown') + ')',\n  'Amount: $' + (p.amount_usd || 0),\n  'Approver: ' + (approval.approver || 'n/a'),\n  'Correlation: `' + p.correlation_id + '`'\n].join('\\n');\nreturn [{ json: {\n  tenant_id: p.tenant_id,\n  correlation_id: p.correlation_id,\n  service: 'onboarding',\n  step: 'approval',\n  text,\n  parse_mode: 'Markdown',\n  timeout_hours: 24,\n  approver: approval.approver || null,\n  second_approver: approval.second_approver || null,\n  payload: {\n    tenant_name: pol.tenant_name,\n    plan: pol.plan,\n    amount_usd: p.amount_usd,\n    approver: approval.approver || null,\n    second_approver: approval.second_approver || null\n  }\n} }];"
+      },
+      "id": "prep-telegram-approval",
+      "name": "Prep Telegram Approval Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "workflowId": "a10b0000-0000-4000-8000-000000000017",
+        "options": {}
+      },
+      "id": "telegram-approve",
+      "name": "Telegram Approve",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [
+        2860,
+        260
       ]
     }
   ],
@@ -550,7 +613,7 @@
       "main": [
         [
           {
-            "node": "Is Replay?",
+            "node": "Is Authorized?",
             "type": "main",
             "index": 0
           }
@@ -707,7 +770,7 @@
       "main": [
         [
           {
-            "node": "Send Approval Request",
+            "node": "Prep Telegram Approval Input",
             "type": "main",
             "index": 0
           }
@@ -721,33 +784,11 @@
         ]
       ]
     },
-    "Send Approval Request": {
-      "main": [
-        [
-          {
-            "node": "Wait For Approval",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Wait For Approval": {
-      "main": [
-        [
-          {
-            "node": "Approved?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Approved?": {
       "main": [
         [
           {
-            "node": "Grant Entitlements",
+            "node": "Prep Audit: Approved",
             "type": "main",
             "index": 0
           }
@@ -799,6 +840,68 @@
         [
           {
             "node": "Audit: Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Audit: Approved": {
+      "main": [
+        [
+          {
+            "node": "Audit: Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit: Approved": {
+      "main": [
+        [
+          {
+            "node": "Grant Entitlements",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Is Replay?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep Telegram Approval Input": {
+      "main": [
+        [
+          {
+            "node": "Telegram Approve",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Approve": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
             "type": "main",
             "index": 0
           }
